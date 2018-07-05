@@ -489,9 +489,19 @@ size_t format_uri ( const struct uri *uri, char *buf, size_t len ) {
 					    "%c", prefix );
 		}
 
+		const char *field_data = uri_field ( uri, field );
+		char *cur_buf = buf + used;
+		size_t remaining = len - used;
+
 		/* Encode this field */
-		used += uri_encode_string ( field, uri_field ( uri, field ),
-					    ( buf + used ), ( len - used ) );
+		if ( uri->raw_fields & (1 << field) ) {
+			if ( buf )
+				strncpy ( cur_buf, field_data, remaining );
+			used += strlen ( field_data );
+		}
+		else
+			used += uri_encode_string ( field, field_data,
+						    cur_buf, remaining );
 
 		/* Suffix this field, if applicable */
 		if ( field == URI_SCHEME ) {
@@ -589,6 +599,9 @@ struct uri * uri_dup ( const struct uri *uri ) {
 
 	/* Copy parameters */
 	dup->params = params_get ( uri->params );
+
+	/* Copy raw fields settings */
+	dup->raw_fields = uri->raw_fields;
 
 	DBGC ( uri, "URI duplicated" );
 	uri_dump ( uri );

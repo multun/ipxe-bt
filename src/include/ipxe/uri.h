@@ -9,6 +9,7 @@
 
 FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <ipxe/refcnt.h>
@@ -50,6 +51,8 @@ struct parameters;
 struct uri {
 	/** Reference count */
 	struct refcnt refcnt;
+	/** A bitset of uri_fields that need no escaping */
+	unsigned long raw_fields;
 	/** Scheme */
 	const char *scheme;
 	/** Opaque part */
@@ -104,6 +107,19 @@ enum uri_fields {
 	URI_FRAGMENT = URI_FIELD ( fragment ),
 	URI_FIELDS
 };
+
+/**
+ * Sets an URI field as raw, which is not to be encoded when formatting.
+ *
+ * @v uri			URI
+ * @v field			URI Field to set the raw status of
+ * @v is_raw			New raw status of the field
+ */
+static inline void uri_set_raw ( struct uri * uri, enum uri_fields field,
+				 bool is_raw ) {
+	uri->raw_fields &= ~( 1UL << ( field ) );
+	uri->raw_fields |= is_raw << ( field );
+}
 
 /**
  * URI is an absolute URI

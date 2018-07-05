@@ -599,6 +599,7 @@ int http_open ( struct interface *xfer, struct http_method *method,
 
 	/* Calculate request URI length */
 	memset ( &request_uri, 0, sizeof ( request_uri ) );
+	request_uri.raw_fields = uri->raw_fields;
 	request_uri.path = ( uri->path ? uri->path : "/" );
 	request_uri.query = uri->query;
 	request_uri_len =
@@ -606,6 +607,7 @@ int http_open ( struct interface *xfer, struct http_method *method,
 
 	/* Calculate host name length */
 	memset ( &request_host, 0, sizeof ( request_host ) );
+	request_host.raw_fields = uri->raw_fields;
 	request_host.host = uri->host;
 	request_host.port = uri->port;
 	request_host_len =
