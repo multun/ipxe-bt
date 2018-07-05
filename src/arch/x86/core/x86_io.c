@@ -32,6 +32,8 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
  *
  */
 
+#ifndef __x86_64__
+
 /**
  * Read 64-bit qword from memory-mapped device
  *
@@ -71,6 +73,7 @@ static __unused void i386_writeq ( uint64_t data, volatile uint64_t *io_addr ) {
 			       "emms\n\t"
 			       : : "A" ( data ), "r" ( io_addr ) );
 }
+#endif
 
 PROVIDE_IOAPI_INLINE ( x86, phys_to_bus );
 PROVIDE_IOAPI_INLINE ( x86, bus_to_phys );

@@ -125,11 +125,11 @@ static const char *w89c840_version = "driver Version 0.94 - December 12, 2003";
  * #define TX_LOOP_COUNT 10000000
  */
 
-#if !defined(__OPTIMIZE__)
-#warning  You must compile this file with the correct options!
-#warning  See the last lines of the source file.
-#error You must compile this driver with "-O".
-#endif
+/* #if !defined(__OPTIMIZE__) */
+/* #warning  You must compile this file with the correct options! */
+/* #warning  See the last lines of the source file. */
+/* #error You must compile this driver with "-O". */
+/* #endif */
 
 enum chip_capability_flags {CanHaveMII=1, HasBrokenTx=2};
 

@@ -65,10 +65,15 @@ assert_printf ( const char *fmt, ... ) asm ( "printf" );
  * intended to be portable.
  *
  */
+#ifdef __OPTIMIZE__
 #define linker_assert( condition, error_symbol )	\
         if ( ! (condition) ) {				\
                 extern void error_symbol ( void );	\
                 error_symbol();				\
         }
+#else
+#define linker_assert( condition, error_symbol )	\
+        assert(condition && #error_symbol)
+#endif
 
 #endif /* _ASSERT_H */
