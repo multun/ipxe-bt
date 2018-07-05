@@ -201,13 +201,6 @@ struct tcp_options {
  */
 #define TCP_CLOSED TCP_RST
 
-/** LISTEN
- *
- * Not currently used as a state; we have no support for listening
- * connections.  Given a unique value to avoid compiler warnings.
- */
-#define TCP_LISTEN 0
-
 /** SYN_SENT
  *
  * SYN has been sent, nothing has yet been received or acknowledged.
@@ -434,5 +427,24 @@ static inline int tcp_in_window ( uint32_t seq, uint32_t start,
 #define TCP_FINISH_TIMEOUT ( 1 * TICKS_PER_SEC )
 
 extern struct tcpip_protocol tcp_protocol __tcpip_protocol;
+
+
+extern int tcp_notify_connect ( struct interface *intf,
+                                struct sockaddr_tcpip *st_peer,
+                                struct sockaddr_tcpip *st_local,
+                                struct tcp_header *tcphdr );
+
+#define tcp_notify_connect_TYPE( object_type ) \
+        typeof ( int ( object_type, \
+                       struct sockaddr_tcpip *st_local,   \
+                       struct sockaddr_tcpip *st_peer,    \
+                       struct tcp_header *tcphdr ) )
+
+
+int tcp_accept ( struct interface *xfer, struct sockaddr_tcpip *st_peer,
+		 struct sockaddr_tcpip *st_local, struct tcp_header *tcphdr );
+
+int tcp_listen ( struct interface *xfer, struct sockaddr *local );
+
 
 #endif /* _IPXE_TCP_H */

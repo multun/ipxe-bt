@@ -246,3 +246,14 @@ int tcpip_bind ( struct sockaddr_tcpip *st_local,
 	}
 	return -EADDRINUSE;
 }
+
+int tcpip_sock_compare ( struct sockaddr_tcpip * a,
+			 struct sockaddr_tcpip * b ) {
+	if ( a->st_family != b->st_family ||
+	     a->st_port != b->st_port ||
+	     a->st_family != b->st_family ||
+	     a->st_scope_id != b->st_scope_id )
+		return 1;
+
+	return memcmp ( &a->pad, &b->pad, sizeof ( a->pad ) );
+}

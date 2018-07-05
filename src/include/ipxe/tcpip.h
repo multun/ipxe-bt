@@ -203,4 +203,7 @@ extern uint16_t tcpip_chksum ( const void *data, size_t len );
 extern int tcpip_bind ( struct sockaddr_tcpip *st_local,
 			int ( * available ) ( int port ) );
 
+extern int tcpip_sock_compare ( struct sockaddr_tcpip * a,
+				struct sockaddr_tcpip * b );
+
 #endif /* _IPXE_TCPIP_H */

@@ -124,6 +124,19 @@ struct tcp_connection {
 	struct pending_operation pending_data;
 };
 
+/** A TCP connection */
+struct tcp_listening_connection {
+	/** Reference counter */
+	struct refcnt refcnt;
+	/** List of listening TCP connections */
+	struct list_head list;
+
+	/** Notification transfer interface */
+	struct interface xfer;
+	/** Local port */
+	unsigned int local_port;
+};
+
 /** TCP flags */
 enum tcp_flags {
 	/** TCP data transfer interface has been closed */
@@ -166,6 +179,8 @@ struct tcp_rx_queued_header {
  */
 static LIST_HEAD ( tcp_conns );
 
+static LIST_HEAD ( tcp_listening_conns );
+
 /** Transmit profiler */
 static struct profiler tcp_tx_profiler __profiler = { .name = "tcp.tx" };
 
@@ -181,7 +196,8 @@ static struct interface_descriptor tcp_xfer_desc;
 static void tcp_expired ( struct retry_timer *timer, int over );
 static void tcp_keepalive_expired ( struct retry_timer *timer, int over );
 static void tcp_wait_expired ( struct retry_timer *timer, int over );
-static struct tcp_connection * tcp_demux ( unsigned int local_port );
+static struct tcp_connection * tcp_demux ( struct sockaddr_tcpip * local,
+                                           struct sockaddr_tcpip * peer );
 static int tcp_rx_ack ( struct tcp_connection *tcp, uint32_t ack,
 			uint32_t win );
 
@@ -195,7 +211,6 @@ static inline __attribute__ (( always_inline )) const char *
 tcp_state ( int state ) {
 	switch ( state ) {
 	case TCP_CLOSED:		return "CLOSED";
-	case TCP_LISTEN:		return "LISTEN";
 	case TCP_SYN_SENT:		return "SYN_SENT";
 	case TCP_SYN_RCVD:		return "SYN_RCVD";
 	case TCP_ESTABLISHED:		return "ESTABLISHED";
@@ -250,6 +265,17 @@ tcp_dump_flags ( struct tcp_connection *tcp, unsigned int flags ) {
  ***************************************************************************
  */
 
+static struct tcp_listening_connection *
+tcp_find_listening_connection ( int port ) {
+	struct tcp_listening_connection * tcp_listening;
+	list_for_each_entry ( tcp_listening, &tcp_listening_conns, list ) {
+		if ( tcp_listening->local_port == ( unsigned int )port )
+                    return tcp_listening;
+	}
+
+	return NULL;
+}
+
 /**
  * Check if local TCP port is available
  *
@@ -257,32 +283,30 @@ tcp_dump_flags ( struct tcp_connection *tcp, unsigned int flags ) {
  * @ret port		Local port number, or negative error
  */
 static int tcp_port_available ( int port ) {
+	struct tcp_connection * tcp;
 
-	return ( tcp_demux ( port ) ? -EADDRINUSE : port );
+	list_for_each_entry ( tcp, &tcp_conns, list ) {
+		if ( tcp->local_port == ( unsigned int )port )
+			return -EADDRINUSE;
+	}
+
+	return tcp_find_listening_connection( port ) ? -EADDRINUSE : port;
 }
 
 /**
- * Open a TCP connection
+ * Common connection initialization between open and accept
  *
+ * @v tcp		Connection to initialize
  * @v xfer		Data transfer interface
- * @v peer		Peer socket address
- * @v local		Local socket address, or NULL
+ * @v st_peer		Peer socket address
  * @ret rc		Return status code
  */
-static int tcp_open ( struct interface *xfer, struct sockaddr *peer,
-		      struct sockaddr *local ) {
-	struct sockaddr_tcpip *st_peer = ( struct sockaddr_tcpip * ) peer;
-	struct sockaddr_tcpip *st_local = ( struct sockaddr_tcpip * ) local;
-	struct tcp_connection *tcp;
+static int tcp_finalize_open ( struct tcp_connection *tcp,
+			       struct interface *xfer,
+			       struct sockaddr_tcpip *st_peer ) {
 	size_t mtu;
-	int port;
 	int rc;
 
-	/* Allocate and initialise structure */
-	tcp = zalloc ( sizeof ( *tcp ) );
-	if ( ! tcp )
-		return -ENOMEM;
-	DBGC ( tcp, "TCP %p allocated\n", tcp );
 	ref_init ( &tcp->refcnt, NULL );
 	intf_init ( &tcp->xfer, &tcp_xfer_desc, &tcp->refcnt );
 	process_init_stopped ( &tcp->process, &tcp_process_desc, &tcp->refcnt );
@@ -290,9 +314,7 @@ static int tcp_open ( struct interface *xfer, struct sockaddr *peer,
 	timer_init ( &tcp->keepalive, tcp_keepalive_expired, &tcp->refcnt );
 	timer_init ( &tcp->wait, tcp_wait_expired, &tcp->refcnt );
 	tcp->prev_tcp_state = TCP_CLOSED;
-	tcp->tcp_state = TCP_STATE_SENT ( TCP_SYN );
 	tcp_dump_state ( tcp );
-	tcp->snd_seq = random();
 	INIT_LIST_HEAD ( &tcp->tx_queue );
 	INIT_LIST_HEAD ( &tcp->rx_queue );
 	memcpy ( &tcp->peer, st_peer, sizeof ( tcp->peer ) );
@@ -301,22 +323,11 @@ static int tcp_open ( struct interface *xfer, struct sockaddr *peer,
 	mtu = tcpip_mtu ( &tcp->peer );
 	if ( ! mtu ) {
 		DBGC ( tcp, "TCP %p has no route to %s\n",
-		       tcp, sock_ntoa ( peer ) );
+		       tcp, sock_ntoa ( ( struct sockaddr * ) st_peer ) );
 		rc = -ENETUNREACH;
 		goto err;
 	}
 	tcp->mss = ( mtu - sizeof ( struct tcp_header ) );
-
-	/* Bind to local port */
-	port = tcpip_bind ( st_local, tcp_port_available );
-	if ( port < 0 ) {
-		rc = port;
-		DBGC ( tcp, "TCP %p could not bind: %s\n",
-		       tcp, strerror ( rc ) );
-		goto err;
-	}
-	tcp->local_port = port;
-	DBGC ( tcp, "TCP %p bound to port %d\n", tcp, tcp->local_port );
 
 	/* Start timer to initiate SYN */
 	start_timer_nodelay ( &tcp->timer );
@@ -332,6 +343,147 @@ static int tcp_open ( struct interface *xfer, struct sockaddr *peer,
 	return 0;
 
  err:
+	ref_put ( &tcp->refcnt );
+	return rc;
+}
+
+/**
+ * Open a TCP connection
+ *
+ * @v xfer		Data transfer interface
+ * @v peer		Peer socket address
+ * @v local		Local socket address, or NULL
+ * @ret rc		Return status code
+ */
+static int tcp_open ( struct interface * xfer, struct sockaddr * peer,
+		      struct sockaddr * local ) {
+	int rc;
+	int port;
+
+	struct tcp_connection * tcp;
+	struct sockaddr_tcpip * st_peer = ( struct sockaddr_tcpip * )peer;
+	struct sockaddr_tcpip * st_local = ( struct sockaddr_tcpip * )local;
+
+	tcp = zalloc ( sizeof ( *tcp ) );
+	if ( ! tcp )
+		return -ENOMEM;
+
+	DBGC ( tcp, "TCP %p allocated\n", tcp );
+
+	/* Bind to local port */
+	port = tcpip_bind ( st_local, tcp_port_available );
+	if ( port < 0 ) {
+		rc = port;
+		DBGC ( tcp, "TCP %p could not bind: %s\n",
+		       tcp, strerror ( rc ) );
+		goto err_bind;
+	}
+	tcp->local_port = port;
+	DBGC ( tcp, "TCP %p bound to port %d\n", tcp, tcp->local_port );
+
+	tcp->snd_seq = random ();
+	tcp->tcp_state = TCP_SYN_SENT;
+
+	return tcp_finalize_open ( tcp, xfer, st_peer );
+
+err_bind:
+	free ( tcp );
+	return rc;
+}
+
+/**
+ * Accept a TCP connection
+ *
+ * @v xfer		Data transfer interface
+ * @v st_peer		Peer socket address
+ * @v st_local		Local socket address
+ * @v tcphdr		Header of the incoming request
+ * @ret rc		Return status code
+ */
+int tcp_accept ( struct interface * xfer,
+		 struct sockaddr_tcpip * st_peer,
+		 struct sockaddr_tcpip * st_local,
+		 struct tcp_header * tcphdr ) {
+	struct tcp_connection * tcp;
+
+	tcp = zalloc ( sizeof ( *tcp ) );
+	if ( ! tcp )
+		return -ENOMEM;
+
+	DBGC ( tcp, "TCP %p allocated\n", tcp );
+
+	tcp->local_port = ntohs ( st_local->st_port );
+	tcp->rcv_ack = ntohl ( tcphdr->seq );
+	tcp->tcp_state = TCP_SYN_RCVD;
+
+	return tcp_finalize_open ( tcp, xfer, st_peer );
+}
+
+/**
+ * Close a listening connection
+ *
+ * @v tcp		Connection
+ * @v rc		Close status code
+ */
+void tcp_listening_close ( struct tcp_listening_connection * tcp, int rc ) {
+	/* Close notification interface */
+	intf_close ( &tcp->xfer, rc );
+
+	/* Stop listening */
+	list_del ( &tcp->list );
+}
+
+static struct interface_operation tcp_listening_operations[] = {
+	INTF_OP ( intf_close, struct tcp_listening_connection *,
+		  tcp_listening_close ),
+};
+
+static struct interface_descriptor tcp_listening_desc =
+	INTF_DESC ( struct tcp_listening_connection, xfer,
+		    tcp_listening_operations );
+
+
+/**
+ * Listen for incoming TCP connections
+ *
+ * @v xfer		Attempt notification interface
+ * @v local		Local socket address
+ * @ret rc		Return status code
+ */
+int tcp_listen ( struct interface * xfer, struct sockaddr * local ) {
+	struct tcp_listening_connection * tcp;
+	int port;
+	int rc;
+
+	/* Allocate and initialise structure */
+	tcp = zalloc ( sizeof ( *tcp ) );
+	if ( ! tcp )
+		return -ENOMEM;
+
+	DBGC ( tcp, "listening TCP %p allocated\n", tcp );
+	ref_init ( &tcp->refcnt, NULL );
+
+	intf_init ( &tcp->xfer, &tcp_listening_desc, &tcp->refcnt );
+
+	/* Bind to local port */
+	port = tcpip_bind ( ( struct sockaddr_tcpip * )local, tcp_port_available );
+	if ( port < 0 ) {
+		rc = port;
+		DBGC ( tcp, "TCP %p could not bind: %s\n",
+		       tcp, strerror ( rc ) );
+		goto err_bind;
+	}
+	tcp->local_port = port;
+	DBGC ( tcp, "TCP %p bound to port %d\n", tcp, tcp->local_port );
+
+	/* Attach parent interface, transfer reference to connection
+	 * list and return
+	 */
+	intf_plug_plug ( &tcp->xfer, xfer );
+	list_add ( &tcp->list, &tcp_listening_conns );
+	return 0;
+
+ err_bind:
 	ref_put ( &tcp->refcnt );
 	return rc;
 }
@@ -925,11 +1077,15 @@ static int tcp_xmit_reset ( struct tcp_connection *tcp,
  * @v local_port	Local port
  * @ret tcp		TCP connection, or NULL
  */
-static struct tcp_connection * tcp_demux ( unsigned int local_port ) {
-	struct tcp_connection *tcp;
+static struct tcp_connection * tcp_demux ( struct sockaddr_tcpip * local,
+					   struct sockaddr_tcpip * peer ) {
+	struct tcp_connection * tcp;
+
+        uint16_t local_port = ntohs ( local->st_port );
 
 	list_for_each_entry ( tcp, &tcp_conns, list ) {
-		if ( tcp->local_port == local_port )
+		if ( tcp->local_port == local_port &&
+		     tcpip_sock_compare ( &tcp->peer, peer ) == 0 )
 			return tcp;
 	}
 	return NULL;
@@ -1381,6 +1537,31 @@ static void tcp_process_rx_queue ( struct tcp_connection *tcp ) {
 	}
 }
 
+int tcp_notify_connect ( struct interface *intf, struct sockaddr_tcpip *st_peer,
+			 struct sockaddr_tcpip *st_local,
+			 struct tcp_header *tcphdr ) {
+	int rc;
+
+	struct interface *dest;
+	tcp_notify_connect_TYPE ( void * ) *op =
+	    intf_get_dest_op ( intf, tcp_notify_connect, &dest );
+	void *object = intf_object ( dest );
+	size_t len;
+
+	if ( op ) {
+		len = op ( object, st_peer, st_local, tcphdr );
+	} else {
+		rc = -EPIPE;
+		goto err;
+	}
+
+	intf_put ( dest );
+	return len;
+
+err:
+	return rc;
+}
+
 /**
  * Process received packet
  *
@@ -1394,7 +1575,7 @@ static void tcp_process_rx_queue ( struct tcp_connection *tcp ) {
 static int tcp_rx ( struct io_buffer *iobuf,
 		    struct net_device *netdev __unused,
 		    struct sockaddr_tcpip *st_src,
-		    struct sockaddr_tcpip *st_dest __unused,
+		    struct sockaddr_tcpip *st_dest,
 		    uint16_t pshdr_csum ) {
 	struct tcp_header *tcphdr = iobuf->data;
 	struct tcp_connection *tcp;
@@ -1442,9 +1623,13 @@ static int tcp_rx ( struct io_buffer *iobuf,
 		rc = -EINVAL;
 		goto discard;
 	}
-	
+
+        /* augment the sockaddrs with tcp port numbers */
+	st_src->st_port = tcphdr->src;
+	st_dest->st_port = tcphdr->dest;
+
 	/* Parse parameters from header and strip header */
-	tcp = tcp_demux ( ntohs ( tcphdr->dest ) );
+	tcp = tcp_demux ( st_dest, st_src );
 	seq = ntohl ( tcphdr->seq );
 	ack = ntohl ( tcphdr->ack );
 	raw_win = ntohs ( tcphdr->win );
@@ -1466,10 +1651,31 @@ static int tcp_rx ( struct io_buffer *iobuf,
 	tcp_dump_flags ( tcp, tcphdr->flags );
 	DBGC2 ( tcp, "\n" );
 
-	/* If no connection was found, silently drop packet */
-	if ( ! tcp ) {
-		rc = -ENOTCONN;
-		goto discard;
+	/* If no connection was found, check for listening sockets */
+	if ( !tcp ) {
+
+		/* Listening connections start with a syn*/
+		if ( !( flags & TCP_SYN ) || ( flags & TCP_ACK ) ) {
+			rc = -ENOTCONN;
+			goto discard;
+		}
+
+		tcphdr->seq = htonl ( seq + seq_len );
+
+		struct tcp_listening_connection *listening_conn;
+		listening_conn =
+		    tcp_find_listening_connection ( ntohs ( tcphdr->dest ) );
+
+		if ( !listening_conn ) {
+			rc = -ENOTCONN;
+			tcp_xmit_reset ( tcp, st_src, tcphdr );
+		} else if ( ( rc = tcp_notify_connect ( &listening_conn->xfer,
+							st_src, st_dest,
+							tcphdr ) ) != 0 )
+			tcp_xmit_reset ( tcp, st_src, tcphdr );
+
+		/* discard the message anyway */
+                goto discard;
 	}
 
 	/* Record old data-transfer window */
