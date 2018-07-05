@@ -105,6 +105,7 @@ SRCDIRS		+= config
 # Boot signing.
 #
 SRCDIRS_INSEC	+= net/oncrpc
+SRCDIRS_INSEC	+= net/bittorrent
 SRCDIRS_INSEC	+= net/80211
 SRCDIRS_INSEC	+= drivers/net/rtl818x
 SRCDIRS_INSEC	+= drivers/net/ath
