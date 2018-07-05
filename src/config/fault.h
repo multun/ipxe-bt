@@ -29,6 +29,18 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
 /* Corrupt every N received PeerDist packets */
 #define PEERBLK_CORRUPT_RATE 0
 
+/* Corrupt every N received BitTorrent packets */
+#define BTCLIENT_CORRUPT_RATE 0
+
+/* Annul every N BitTorrent download attempts */
+#define BTCLIENT_ANNUL_RATE 0
+
+/* Annul every N Torrent tracker announces */
+#define TORRENT_ANNUL_RATE 0
+
+/* Stall every N BitTorrent download attempts */
+#define BTCLIENT_STALL_RATE 0
+
 #include <config/local/fault.h>
 
 #endif /* CONFIG_FAULT_H */

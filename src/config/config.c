@@ -120,6 +120,9 @@ REQUIRE_OBJECT ( ftp );
 #ifdef DOWNLOAD_PROTO_NFS
 REQUIRE_OBJECT ( nfs_open );
 #endif
+#ifdef DOWNLOAD_PROTO_BITTORRENT
+REQUIRE_OBJECT ( bittorrent );
+#endif
 #ifdef DOWNLOAD_PROTO_SLAM
 REQUIRE_OBJECT ( slam );
 #endif
