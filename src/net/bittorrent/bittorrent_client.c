@@ -16,7 +16,7 @@ typedef int ( *bt_client_transmitter ) ( struct bt_client *client );
 typedef int ( *bt_client_receiver ) ( struct bt_client *client,
 				      struct io_buffer *iobuf );
 
-#define TX_QUEUE_SIZE 10
+#define TX_RING_SIZE 10
 #define TX_CHUNK_SIZE 400
 
 struct bt_client {
@@ -66,12 +66,16 @@ struct bt_client {
 		uint32_t index;
 		uint32_t begin;
 		uint32_t length;
-	}   __attribute__ (( packed )) tx_queue[TX_QUEUE_SIZE];
+	}   __attribute__ (( packed )) tx_ring[TX_RING_SIZE];
 
+	size_t tx_ring_cons;
+	size_t tx_ring_prod;
+	size_t tx_ring_count;
+
+	/* Keeps track of how much data has been sent within
+	   the current request */
 	size_t tx_cursor;
-	size_t pending_requests;
 };
-
 
 #define BTCLIENT_RX_TIMEOUT ( 10 * TICKS_PER_SEC )
 #define BTCLIENT_CONN_RX_TIMEOUT ( 10 * TICKS_PER_SEC )
@@ -81,7 +85,7 @@ struct bt_client {
 #define MAX_BLOCKS 3
 
 static void btclient_close ( struct bt_client * client, int rc );
-static int btclient_tx ( struct bt_client *client );
+static int btclient_tx ( struct bt_client * client );
 
 /* same as above, but unregisters the client on error */
 static void btclient_tx_fatal ( struct bt_client * client ) {
@@ -93,20 +97,20 @@ static void btclient_tx_fatal ( struct bt_client * client ) {
 	torrent_client_unregister ( &client->base_client );
 }
 
-static void btclient_reset_rx ( struct bt_client *client );
-static void btclient_expect_rx ( struct bt_client *client,
+static void btclient_reset_rx ( struct bt_client * client );
+static void btclient_expect_rx ( struct bt_client * client,
 				 bt_client_receiver receiver );
 
-static int btclient_tx_handshake ( struct bt_client *client );
-static int btclient_rx_handshake ( struct bt_client *client,
-                                   struct io_buffer *io_buf );
+static int btclient_tx_handshake ( struct bt_client * client );
+static int btclient_rx_handshake ( struct bt_client * client,
+				   struct io_buffer * io_buf );
 
 static inline bool btclient_handshake_finished( struct bt_client * client ) {
 	return client->tx == NULL && client->rx != btclient_rx_handshake;
 }
 
 static void btclient_free ( struct refcnt * refcnt ) {
-	struct bt_client *client =
+	struct bt_client * client =
 	    container_of ( refcnt, struct bt_client, base_client.refcnt );
 
 	DBGC ( client, "BTCLIENT %p freed\n", client );
@@ -320,10 +324,12 @@ err_deliver:
         return rc;
 }
 
-static int btclient_rx_request ( struct bt_client *client,
-				 struct io_buffer *io_buf ) {
+static int btclient_rx_request ( struct bt_client * client,
+				 struct io_buffer * io_buf ) {
+	/* checking whether the ring buffer is full is done within rx_type */
+
 	struct pending_request *request =
-	    &client->tx_queue[ client->pending_requests ];
+	    &client->tx_ring[ client->tx_ring_prod ];
 
 	if ( !iob_prog_pull_copy ( &client->rx_cursor,
 				   sizeof ( struct pending_request ), request,
@@ -354,14 +360,9 @@ static int btclient_rx_request ( struct bt_client *client,
 	     request->begin + request->length > piece->length )
 		return -EPROTO;
 
-        assert ( client->pending_requests <= TX_QUEUE_SIZE );
-	if ( client->pending_requests < TX_QUEUE_SIZE ) {
-		client->pending_requests++;
-		DBGC ( client, "BTCLIENT %p enqueueing request\n", client );
-	} else
-		DBGC ( client,
-		       "BTCLIENT %p discarding request: overflowing queue\n",
-		       client );
+	/* increment the count of pending elements */
+	client->tx_ring_count++;
+	client->tx_ring_prod = ( client->tx_ring_prod + 1 ) % TX_RING_SIZE;
 
 	btclient_reset_rx ( client );
 
@@ -517,19 +518,24 @@ static int btclient_rx_type ( struct bt_client *client,
 			goto err_proto;
 
 		if ( client->choking ) {
-			DBGC ( client,
-			       "BTCLIENT %p peer is being choked, discarding "
-			       "request\n",
-			       client );
-			btclient_expect_rx ( client, btclient_rx_discard );
-		} else
-			btclient_expect_rx ( client, btclient_rx_request );
+			DBGC ( client, "BTCLIENT %p peer is being choked, "
+			       "discarding request\n", client );
+			goto rx_discard;
+		} else {
+			if ( client->tx_ring_count == TX_RING_SIZE ) {
+				DBGC ( client, "BTCLIENT %p tx ring buffer full"
+				       ", discarding request\n", client );
+				goto rx_discard;
+			}
 
+			btclient_expect_rx ( client, btclient_rx_request );
+		}
 		break;
 
 	case BTTYPE_CANCEL:
 	case BTTYPE_PORT:
 		/** Ignoring cancels should be ok */
+	rx_discard:
 		btclient_expect_rx ( client, btclient_rx_discard );
 		break;
 	}
@@ -863,11 +869,10 @@ static int btclient_tx_have ( struct bt_client *client ) {
 static int btclient_tx_piece ( struct bt_client *client ) {
 	int rc;
 
-	assert ( client->pending_requests );
+	assert ( client->tx_ring_count );
 
-	/* we need to take the first request and shift the whole stack
-	   once done. A proper solution would be to use a ring buffer */
-	struct pending_request *request = &client->tx_queue[ 0 ];
+	struct pending_request *request =
+	    &client->tx_ring[ client->tx_ring_cons ];
 
 	assert ( client->tx_cursor <= request->length );
 
@@ -918,17 +923,17 @@ static int btclient_tx_piece ( struct bt_client *client ) {
 
 	client->tx_cursor += chunk_size;
 	if ( client->tx_cursor == request->length ) {
+		/* reset sent bytes count */
 		client->tx_cursor = 0;
 
 		DBGCIO ( client, "BTCLIENT %p delivered piece\n", client );
 
 		torrent_sent_data ( &client->base_client, request->length );
 
-		client->pending_requests--;
-		// FIXME: use a ring buffer
-		memmove ( &client->tx_queue[ 0 ], &client->tx_queue[ 1 ],
-			  sizeof ( struct pending_request ) *
-			      client->pending_requests );
+		client->tx_ring_count--;
+		client->tx_ring_cons =
+		    ( client->tx_ring_cons + 1 ) % TX_RING_SIZE;
+
 		client->tx = NULL;
 	}
 
@@ -953,7 +958,7 @@ btclient_transmit_decision ( struct bt_client *client ) {
 	if ( client->base_client.target == NULL )
 		DBGC ( client, "BTCLIENT %p has no target\n", client );
 	else {
-		if ( !client->interested )
+		if ( ! client->interested )
 			return ( client->tx = btclient_tx_interested );
 
 		if ( client->choked )
@@ -963,7 +968,7 @@ btclient_transmit_decision ( struct bt_client *client ) {
 			return ( client->tx = btclient_tx_request );
 	}
 
-	if ( client->pending_requests )
+	if ( client->tx_ring_count != 0 )
 		return ( client->tx = btclient_tx_piece );
 
 	return NULL;
