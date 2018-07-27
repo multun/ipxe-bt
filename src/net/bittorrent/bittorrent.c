@@ -91,7 +91,10 @@ static void torrent_close ( struct torrent *torrent, int rc ) {
 	struct torrent_client * client;
 	struct torrent_client * tmp;
 
-	stop_timer ( &torrent->scheduler );
+	stop_timer ( &torrent->connection_scheduler );
+	stop_timer ( &torrent->unchoke_scheduler );
+	stop_timer ( &torrent->piece_scheduler );
+	stop_timer ( &torrent->termination_scheduler );
 
 	list_for_each_entry_safe ( client, tmp, &torrent->clients_connected,
 				   conn_state )
@@ -260,7 +263,7 @@ static void torrent_announce_finished ( struct torrent *torrent, int rc ) {
 	xferbuf_malloc_init ( &torrent->tracker_response );
 
 	/* Trigger the scheduler so that it can use newly retrieved peers */
-	torrent_schedule ( torrent );
+	torrent_schedule ( torrent, connection );
 
 	return;
 
@@ -372,8 +375,42 @@ static void torrent_finished ( struct torrent * torrent ) {
 	torrent_close ( torrent, 0 );
 }
 
-void torrent_step ( struct torrent * torrent ) {
-	DBGC ( torrent, "TORRENT %p stepping\n", torrent );
+void torrent_connection_scheduler ( struct retry_timer *timer,
+				    int __unused over ) {
+
+	struct torrent *torrent =
+	    container_of ( timer, struct torrent, connection_scheduler );
+
+	DBGC ( torrent, "TORRENT %p connection scheduler stepping\n", torrent );
+
+	struct torrent_client * client, * tmp;
+	list_for_each_entry_safe ( client, tmp, &torrent->clients_disconnected,
+				   conn_state )
+		torrent_client_connect ( client );
+}
+
+void torrent_unchoke_scheduler ( struct retry_timer *timer,
+				 int __unused over ) {
+
+	struct torrent *torrent =
+	    container_of ( timer, struct torrent, unchoke_scheduler );
+
+	DBGC ( torrent, "TORRENT %p unchoke scheduler stepping\n", torrent );
+
+        struct torrent_client * client, * tmp;
+	list_for_each_entry_safe (
+	    client, tmp, &torrent->clients_unchoke_pending, unchoke_state ) {
+		torrent_client_set_choke ( client, false );
+	}
+}
+
+void torrent_termination_scheduler ( struct retry_timer *timer,
+				     int __unused over ) {
+
+	struct torrent *torrent =
+	    container_of ( timer, struct torrent, termination_scheduler );
+
+	DBGC ( torrent, "TORRENT %p termination scheduler stepping\n", torrent );
 
 	int seed_ratio = torrent->seed_ratio;
 	if ( seed_ratio > 0 ) {
@@ -384,33 +421,32 @@ void torrent_step ( struct torrent * torrent ) {
 	} else if ( list_empty ( &torrent->info.pending_pieces ) )
 		goto torrent_done;
 
-	struct torrent_client * client, * tmp;
-	list_for_each_entry_safe ( client, tmp, &torrent->clients_disconnected,
-				   conn_state )
-		torrent_client_connect ( client );
-
-	list_for_each_entry_safe (
-	    client, tmp, &torrent->clients_unchoke_pending, unchoke_state ) {
-		torrent_client_set_choke ( client, false );
-	}
-
-	if ( !list_empty ( &torrent->info.pending_pieces ) ) {
-		struct torrent_client * best_client;
-		struct torrent_piece * best_piece =
-		    find_best_piece ( &best_client, torrent );
-		if ( best_piece ) {
-			DBGC ( best_client,
-			       "TORRENT_CLIENT %p requesting piece %zd\n",
-			       ( void * )best_client, best_piece->id );
-			torrent_client_request ( best_client, best_piece );
-		}
-	}
-
 	return;
 
 torrent_done:
 	torrent_finished ( torrent );
 	return;
+}
+
+void torrent_piece_scheduler ( struct retry_timer *timer, int __unused over ) {
+	struct torrent *torrent =
+	    container_of ( timer, struct torrent, piece_scheduler );
+
+	DBGC ( torrent, "TORRENT %p piece scheduler stepping\n", torrent );
+
+	if ( list_empty ( &torrent->info.pending_pieces ) ) {
+		DBGC ( torrent, "TORRENT %p no remaining piece\n", torrent );
+		return;
+	}
+
+	struct torrent_client *best_client;
+	struct torrent_piece *best_piece =
+	    find_best_piece ( &best_client, torrent );
+	if ( best_piece ) {
+		DBGC ( best_client, "TORRENT_CLIENT %p requesting piece %zd\n",
+		       ( void * )best_client, best_piece->id );
+		torrent_client_request ( best_client, best_piece );
+	}
 }
 
 /** Job control interface operations */
@@ -479,11 +515,6 @@ err_announce:
 }
 
 
-static void torrent_scheduler_expired ( struct retry_timer * timer,
-					int __unused over ) {
-	torrent_step ( container_of ( timer, struct torrent, scheduler ) );
-}
-
 /**
  * Initiate a BitTorrent download
  *
@@ -517,7 +548,20 @@ static int torrent_open ( struct interface *xfer, struct uri *uri ) {
 	timer_init ( &torrent->announce_timer, torrent_announce_expired,
 		     &torrent->refcnt );
 
-	timer_init ( &torrent->scheduler, torrent_scheduler_expired,
+	timer_init ( &torrent->connection_scheduler,
+		     torrent_connection_scheduler,
+		     &torrent->refcnt );
+
+	timer_init ( &torrent->unchoke_scheduler,
+		     torrent_unchoke_scheduler,
+		     &torrent->refcnt );
+
+	timer_init ( &torrent->piece_scheduler,
+		     torrent_piece_scheduler,
+		     &torrent->refcnt );
+
+	timer_init ( &torrent->termination_scheduler,
+		     torrent_termination_scheduler,
 		     &torrent->refcnt );
 
 	INIT_LIST_HEAD ( &torrent->clients_all );
@@ -544,8 +588,8 @@ static int torrent_open ( struct interface *xfer, struct uri *uri ) {
 	if ( ( rc = torrent_announce ( torrent ) ) != 0 )
 		goto err_announce;
 
-	/* torrent->seed_ratio = 200; */
-	torrent->seed_ratio = -1;
+	torrent->seed_ratio = 200;
+	/* torrent->seed_ratio = -1; */
 
 	return 0;
 
@@ -596,8 +640,21 @@ void torrent_received_piece ( struct torrent_client *client,
 	client_set_state ( client, rx_state, rx_available );
 
 	/* we need to distribute pieces or stop the torrent if done */
-	torrent_schedule ( torrent );
+	if ( list_empty ( &torrent->info.pending_pieces ) )
+		torrent_schedule ( torrent, termination );
+	else
+		torrent_schedule ( torrent, piece );
 }
+
+void torrent_sent_data ( struct torrent_client * client, size_t size ) {
+
+	struct torrent * torrent = client->torrent;
+
+	torrent->info.downloaded += size;
+	/* the torrent may want to stop seeding at some point */
+	torrent_schedule ( torrent, piece );
+}
+
 
 /** BitTorrent URI opener */
 struct uri_opener bittorrent_uri_opener __uri_opener = {

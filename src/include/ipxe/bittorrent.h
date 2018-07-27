@@ -116,7 +116,10 @@ struct torrent {
 	/* available clients are connected and have no allocated piece */
 	struct list_head clients_rx_available;
 
-	struct retry_timer scheduler;
+	struct retry_timer connection_scheduler;
+	struct retry_timer unchoke_scheduler;
+	struct retry_timer piece_scheduler;
+	struct retry_timer termination_scheduler;
 
 	struct interface server;
 	struct retry_timer announce_timer;
@@ -148,12 +151,13 @@ struct uri * torrent_announce_uri ( struct torrent_info * info,
 
 void torrent_step ( struct torrent * torrent );
 
-static __unused void torrent_schedule ( struct torrent * torrent ) {
-	start_timer_nodelay ( &torrent->scheduler );
-}
+#define torrent_schedule( Torrent, Component )                                 \
+	start_timer_nodelay ( &( Torrent )->Component ## _scheduler )
 
 struct torrent_client;
 
 // shall not drop refs to any client, as it's meant to be called from these
 void torrent_received_piece ( struct torrent_client * client,
 			      struct torrent_piece * piece );
+
+void torrent_sent_data ( struct torrent_client * client, size_t size );

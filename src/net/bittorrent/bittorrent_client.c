@@ -163,7 +163,8 @@ static int btclient_tx_handshake ( struct bt_client * client ) {
 	if ( btclient_handshake_finished ( client ) ) {
 		client_set_state ( &client->base_client, rx_state,
 				   rx_available );
-		torrent_schedule ( client->base_client.torrent );
+		// TODO: test how relevant this is
+		torrent_schedule ( client->base_client.torrent, unchoke );
 	}
 
 	return 0;
@@ -222,7 +223,7 @@ static int btclient_rx_bitset ( struct bt_client * client,
 
 	bitset_init_set_count ( piece_bitset );
 	DBGC ( client, "BTCLIENT %p received bitset\n", client );
-	torrent_schedule ( client->base_client.torrent );
+	torrent_schedule ( client->base_client.torrent, piece );
 
 	btclient_reset_rx ( client );
 	return 0;
@@ -240,7 +241,7 @@ static int btclient_rx_have ( struct bt_client * client,
 	DBGC ( client, "BTCLIENT %p received have notification: %d\n", client,
 	       *have );
 
-	torrent_schedule ( client->base_client.torrent );
+	torrent_schedule ( client->base_client.torrent, piece );
 	btclient_reset_rx ( client );
 	return 0;
 }
@@ -475,7 +476,7 @@ static int btclient_rx_type ( struct bt_client *client,
 		DBGC ( client, "BTCLIENT %p peer interested\n", client );
 		client_set_state ( &client->base_client, unchoke_state,
 				   unchoke_pending );
-                torrent_schedule ( client->base_client.torrent );
+		torrent_schedule ( client->base_client.torrent, unchoke );
 		client->interesting = true;
 		goto simple_message;
 
@@ -592,7 +593,7 @@ static int btclient_rx_handshake ( struct bt_client *client,
 	if ( btclient_handshake_finished ( client ) ) {
 		client_set_state ( &client->base_client, rx_state,
 				   rx_available );
-		torrent_schedule ( client->base_client.torrent );
+		torrent_schedule ( client->base_client.torrent, unchoke );
 	}
 
 	return 0;
@@ -921,9 +922,7 @@ static int btclient_tx_piece ( struct bt_client *client ) {
 
 		DBGCIO ( client, "BTCLIENT %p delivered piece\n", client );
 
-		client->base_client.torrent->info.downloaded += request->length;
-		/* the torrent may want to stop seeding at some point */
-		torrent_schedule ( torrent );
+		torrent_sent_data ( &client->base_client, request->length );
 
 		client->pending_requests--;
 		// FIXME: use a ring buffer
