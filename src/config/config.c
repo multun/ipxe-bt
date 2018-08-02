@@ -123,6 +123,9 @@ REQUIRE_OBJECT ( nfs_open );
 #ifdef DOWNLOAD_PROTO_BITTORRENT
 REQUIRE_OBJECT ( bittorrent );
 #endif
+#ifdef DOWNLOAD_PROTO_STREAM_TESTER
+REQUIRE_OBJECT ( stream_tester );
+#endif
 #ifdef DOWNLOAD_PROTO_SLAM
 REQUIRE_OBJECT ( slam );
 #endif

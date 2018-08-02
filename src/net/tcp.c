@@ -55,16 +55,21 @@ struct tcp_connection {
 	 * Maintained only for debug messages
 	 */
 	unsigned int prev_tcp_state;
-	/** Current sequence number
+	/** Oldest unacknowledged sequence number
 	 *
-	 * Equivalent to SND.UNA in RFC 793 terminology.
+	 * Equivalent to SND.UNA in RFC 793 terminology
 	 */
-	uint32_t snd_seq;
-	/** Unacknowledged sequence count
+	uint32_t snd_una;
+	/** Maximum sequence number ever sent
 	 *
-	 * Equivalent to (SND.NXT-SND.UNA) in RFC 793 terminology.
+	 * Differs from snd_max when retransmission occurs
 	 */
-	uint32_t snd_sent;
+	uint32_t snd_max;
+	/** Next sequence number to be sent
+	 *
+	 * Equivalent to SND.NXT in RFC 793 terminology
+	 */
+	uint32_t snd_nxt;
 	/** Send window
 	 *
 	 * Equivalent to SND.WND in RFC 793 terminology
@@ -72,12 +77,12 @@ struct tcp_connection {
 	uint32_t snd_win;
 	/** Current acknowledgement number
 	 *
-	 * Equivalent to RCV.NXT in RFC 793 terminology.
+	 * Equivalent to RCV.NXT in RFC 793 terminology
 	 */
 	uint32_t rcv_ack;
 	/** Receive window
 	 *
-	 * Equivalent to RCV.WND in RFC 793 terminology.
+	 * Equivalent to RCV.WND in RFC 793 terminology
 	 */
 	uint32_t rcv_win;
 	/** Received timestamp value
@@ -123,6 +128,18 @@ struct tcp_connection {
 	/** Pending operations for transmit queue */
 	struct pending_operation pending_data;
 };
+
+/*
+ * Comparing sequence numbers isn't just comparing unsigned integers,
+ * as these wrap around.
+ */
+
+#define SEQ_LT( a, b )	( ( int )( ( a ) - ( b ) ) < 0 )
+#define SEQ_LEQ( a, b )	( ( int )( ( a ) - ( b ) ) <= 0 )
+
+static size_t tcp_inflight ( struct tcp_connection * conn ) {
+	return conn->snd_una - conn->snd_nxt;
+}
 
 /** A TCP connection */
 struct tcp_listening_connection {
@@ -381,7 +398,9 @@ static int tcp_open ( struct interface * xfer, struct sockaddr * peer,
 	tcp->local_port = port;
 	DBGC ( tcp, "TCP %p bound to port %d\n", tcp, tcp->local_port );
 
-	tcp->snd_seq = random ();
+	tcp->snd_nxt = random ();
+	tcp->snd_una = tcp->snd_nxt;
+
 	tcp->tcp_state = TCP_SYN_SENT;
 
 	return tcp_finalize_open ( tcp, xfer, st_peer );
@@ -549,7 +568,7 @@ static void tcp_close ( struct tcp_connection *tcp, int rc ) {
 	 * can send a FIN without breaking things.
 	 */
 	if ( ! ( tcp->tcp_state & TCP_STATE_ACKED ( TCP_SYN ) ) )
-		tcp_rx_ack ( tcp, ( tcp->snd_seq + 1 ), 0 );
+		tcp_rx_ack ( tcp, ( tcp->snd_una + 1 ), 0 );
 
 	/* Stop keepalive timer */
 	stop_timer ( &tcp->keepalive );
@@ -750,7 +769,7 @@ static size_t tcp_process_tx_queue ( struct tcp_connection *tcp, size_t max_len,
  *
  * @v tcp		TCP connection
  * @v sack_seq		SEQ for first selective acknowledgement (if any)
- * 
+ *
  * Transmits any outstanding data on the connection.
  *
  * Note that even if an error is returned, the retransmission timer
@@ -780,10 +799,6 @@ static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
 	/* Start profiling */
 	profile_start ( &tcp_tx_profiler );
 
-	/* If retransmission timer is already running, do nothing */
-	if ( timer_running ( &tcp->timer ) )
-		return;
-
 	/* Calculate both the actual (payload) and sequence space
 	 * lengths that we wish to transmit.
 	 */
@@ -792,13 +807,15 @@ static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
 					     NULL, 0 );
 	}
 	seq_len = len;
+
+	/* Each state holds pending flags, such as FIN or SYN */
 	flags = TCP_FLAGS_SENDING ( tcp->tcp_state );
+
 	if ( flags & ( TCP_SYN | TCP_FIN ) ) {
 		/* SYN or FIN consume one byte, and we can never send both */
 		assert ( ! ( ( flags & TCP_SYN ) && ( flags & TCP_FIN ) ) );
 		seq_len++;
 	}
-	tcp->snd_sent = seq_len;
 
 	/* If we have nothing to transmit, stop now */
 	if ( ( seq_len == 0 ) && ! ( tcp->flags & TCP_ACK_PENDING ) )
@@ -809,14 +826,14 @@ static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
 	 * retransmission timer.  Do this before attempting to
 	 * allocate the I/O buffer, in case allocation itself fails.
 	 */
-	if ( seq_len )
-		start_timer ( &tcp->timer );
-
+	/* if ( seq_len ) */
+	/* 	start_timer ( &tcp->timer ); *
+                /
 	/* Allocate I/O buffer */
 	iobuf = alloc_iob ( len + TCP_MAX_HEADER_LEN );
 	if ( ! iobuf ) {
 		DBGC ( tcp, "TCP %p could not allocate iobuf for %08x..%08x "
-		       "%08x\n", tcp, tcp->snd_seq, ( tcp->snd_seq + seq_len ),
+		       "%08x\n", tcp, tcp->snd_una, ( tcp->snd_una + seq_len ),
 		       tcp->rcv_ack );
 		return;
 	}
@@ -882,7 +899,14 @@ static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
 	memset ( tcphdr, 0, sizeof ( *tcphdr ) );
 	tcphdr->src = htons ( tcp->local_port );
 	tcphdr->dest = tcp->peer.st_port;
-	tcphdr->seq = htonl ( tcp->snd_seq );
+	tcphdr->seq = htonl ( tcp->snd_nxt );
+
+	/* Increase the next sequence number */
+	tcp->snd_nxt += seq_len;
+
+	if ( tcp->snd_nxt > tcp->snd_max )
+		tcp->snd_max = tcp->snd_nxt;
+
 	tcphdr->ack = htonl ( tcp->rcv_ack );
 	tcphdr->hlen = ( ( payload - iobuf->data ) << 2 );
 	tcphdr->flags = flags;
@@ -892,7 +916,7 @@ static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
 	/* Dump header */
 	DBGC2 ( tcp, "TCP %p TX %d->%d %08x..%08x           %08x %4zd",
 		tcp, ntohs ( tcphdr->src ), ntohs ( tcphdr->dest ),
-		ntohl ( tcphdr->seq ), ( ntohl ( tcphdr->seq ) + seq_len ),
+		ntohl ( tcphdr->seq ), tcp->snd_nxt,
 		ntohl ( tcphdr->ack ), len );
 	tcp_dump_flags ( tcp, tcphdr->flags );
 	DBGC2 ( tcp, "\n" );
@@ -901,7 +925,7 @@ static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
 	if ( ( rc = tcpip_tx ( iobuf, &tcp_protocol, NULL, &tcp->peer, NULL,
 			       &tcphdr->csum ) ) != 0 ) {
 		DBGC ( tcp, "TCP %p could not transmit %08x..%08x %08x: %s\n",
-		       tcp, tcp->snd_seq, ( tcp->snd_seq + tcp->snd_sent ),
+		       tcp, ntohl ( tcphdr->seq ), tcp->snd_nxt,
 		       tcp->rcv_ack, strerror ( rc ) );
 		return;
 	}
@@ -939,7 +963,7 @@ static void tcp_expired ( struct retry_timer *timer, int over ) {
 
 	DBGC ( tcp, "TCP %p timer %s in %s for %08x..%08x %08x\n", tcp,
 	       ( over ? "expired" : "fired" ), tcp_state ( tcp->tcp_state ),
-	       tcp->snd_seq, ( tcp->snd_seq + tcp->snd_sent ), tcp->rcv_ack );
+	       tcp->snd_una, tcp->snd_nxt, tcp->rcv_ack );
 
 	assert ( ( tcp->tcp_state == TCP_SYN_SENT ) ||
 		 ( tcp->tcp_state == TCP_SYN_RCVD ) ||
@@ -1000,8 +1024,8 @@ static void tcp_wait_expired ( struct retry_timer *timer, int over __unused ) {
 	assert ( tcp->tcp_state == TCP_TIME_WAIT );
 
 	DBGC ( tcp, "TCP %p wait complete in %s for %08x..%08x %08x\n", tcp,
-	       tcp_state ( tcp->tcp_state ), tcp->snd_seq,
-	       ( tcp->snd_seq + tcp->snd_sent ), tcp->rcv_ack );
+	       tcp_state ( tcp->tcp_state ), tcp->snd_una,
+	       tcp->snd_nxt, tcp->rcv_ack );
 
 	tcp->tcp_state = TCP_CLOSED;
 	tcp_dump_state ( tcp );
@@ -1269,16 +1293,16 @@ static int tcp_rx_syn ( struct tcp_connection *tcp, uint32_t seq,
  */
 static int tcp_rx_ack ( struct tcp_connection *tcp, uint32_t ack,
 			uint32_t win ) {
-	uint32_t ack_len = ( ack - tcp->snd_seq );
+	uint32_t ack_len = ( ack - tcp->snd_una );
 	size_t len;
 	unsigned int acked_flags;
 
 	/* Check for out-of-range or old duplicate ACKs */
-	if ( ack_len > tcp->snd_sent ) {
+	if ( ack_len > tcp_inflight ( tcp ) ) {
 		DBGC ( tcp, "TCP %p received ACK for %08x..%08x, "
-		       "sent only %08x..%08x\n", tcp, tcp->snd_seq,
-		       ( tcp->snd_seq + ack_len ), tcp->snd_seq,
-		       ( tcp->snd_seq + tcp->snd_sent ) );
+		       "sent only %08x..%08x\n", tcp, tcp->snd_una,
+		       ( tcp->snd_una + ack_len ), tcp->snd_una,
+		       tcp->snd_nxt );
 
 		if ( TCP_HAS_BEEN_ESTABLISHED ( tcp->tcp_state ) ) {
 			/* Just ignore what might be old duplicate ACKs */
@@ -1320,13 +1344,12 @@ static int tcp_rx_ack ( struct tcp_connection *tcp, uint32_t ack,
 		pending_put ( &tcp->pending_flags );
 	}
 
-	/* Update SEQ and sent counters */
-	tcp->snd_seq = ack;
-	tcp->snd_sent = 0;
+	/* Move the window forward */
+	tcp->snd_una = ack;
 
 	/* Remove any acknowledged data from transmit queue */
 	tcp_process_tx_queue ( tcp, len, NULL, 1 );
-		
+
 	/* Mark SYN/FIN as acknowledged if applicable. */
 	if ( acked_flags )
 		tcp->tcp_state |= TCP_STATE_ACKED ( acked_flags );
@@ -1970,4 +1993,3 @@ struct uri_opener tcp_uri_opener __uri_opener = {
 	.scheme		= "tcp",
 	.open		= tcp_open_uri,
 };
-

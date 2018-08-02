@@ -284,6 +284,7 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
 #define ERRFILE_bittorrent		( ERRFILE_NET | 0x004b0000 )
 #define ERRFILE_bittorrent_metadata	( ERRFILE_NET | 0x004c0000 )
 #define ERRFILE_bittorrent_client	( ERRFILE_NET | 0x004d0000 )
+#define ERRFILE_stream_tester		( ERRFILE_NET | 0x004e0000 )
 
 #define ERRFILE_image		      ( ERRFILE_IMAGE | 0x00000000 )
 #define ERRFILE_elf		      ( ERRFILE_IMAGE | 0x00010000 )
