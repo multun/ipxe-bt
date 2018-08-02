@@ -596,8 +596,8 @@ static int torrent_open ( struct interface *xfer, struct uri *uri ) {
 err_announce:
 err_listen:
 err_metadata:
-err_alloc:
 	free ( torrent );
+err_alloc:
 	return rc;
 }
 
@@ -647,7 +647,6 @@ void torrent_received_piece ( struct torrent_client *client,
 }
 
 void torrent_sent_data ( struct torrent_client * client, size_t size ) {
-
 	struct torrent * torrent = client->torrent;
 
 	torrent->info.downloaded += size;
