@@ -85,6 +85,10 @@ struct bt_client {
 #define MAX_BLOCKS 3
 
 static void btclient_close ( struct bt_client * client, int rc );
+
+/* transmitting can be done when immediatly responding to a receive, so it may
+   need not to be fatal so that the toplevel handler can close and unregister on
+   error */
 static int btclient_tx ( struct bt_client * client );
 
 /* same as above, but unregisters the client on error */
@@ -94,7 +98,6 @@ static void btclient_tx_fatal ( struct bt_client * client ) {
 		return;
 
 	btclient_close ( client, rc );
-	torrent_client_unregister ( &client->base_client );
 }
 
 static void btclient_reset_rx ( struct bt_client * client );
@@ -131,6 +134,7 @@ static void btclient_close ( struct bt_client * client, int rc ) {
 	stop_timer ( &client->rx_timer );
 	stop_timer ( &client->block_rx_timer );
 	intf_shutdown ( &client->peer, rc );
+	torrent_client_unregister ( &client->base_client );
 }
 
 static int btclient_tx_handshake ( struct bt_client * client ) {
@@ -470,7 +474,7 @@ static int btclient_rx_type ( struct bt_client *client,
 		DBGC ( client, "BTCLIENT %p unchoked\n", client );
 		client->choked = false;
 		if ( ( rc = btclient_tx ( client ) ) != 0 )
-                    goto err_tx;
+			goto err_tx;
 		goto simple_message;
 
 	case BTTYPE_INTERESTED:
@@ -631,7 +635,6 @@ static int btclient_rx ( struct bt_client *client,
 err_rx:
 	DBGC ( client, "BTCLIENT %p rx error, closing\n", client );
 	btclient_close ( client, rc );
-	torrent_client_unregister ( &client->base_client );
 	return rc;
 }
 
@@ -1002,10 +1005,9 @@ static void btclient_rx_timeout ( struct retry_timer *timer,
 
 	client = container_of ( timer, struct bt_client, rx_timer );
 
-	DBGC ( client, "BTCLIENT %p rx timed out, closing and unregistering\n",
+	DBGC ( client, "BTCLIENT %p rx timed out, closing\n",
 	       client );
 	btclient_close ( client, -ETIMEDOUT );
-        torrent_client_unregister ( &client->base_client );
 	return;
 }
 
@@ -1060,7 +1062,6 @@ static int btclient_set_choke ( struct torrent_client * base_client, bool state 
 static void btclient_peer_close ( struct bt_client *client, int rc ) {
 	DBGC ( client, "BTCLIENT %p remote peer closed connection\n", client );
 	btclient_close ( client, rc );
-	torrent_client_unregister ( &client->base_client );
 }
 
 static struct interface_operation bt_torrent_operations[] = {
