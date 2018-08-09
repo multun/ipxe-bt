@@ -28,6 +28,19 @@
 
 FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
 
+struct iobuf_cursor {
+	struct io_buffer *iobuf;
+	size_t offset;
+};
+
+struct tcp_segment {
+	struct list_head list;
+	struct iobuf_cursor buffer;
+	uint32_t seq;
+	uint32_t size;
+	bool acknowledged;
+};
+
 /** A TCP connection */
 struct tcp_connection {
 	/** Reference counter */
@@ -112,6 +125,13 @@ struct tcp_connection {
 
 	/** Transmit queue */
 	struct list_head tx_queue;
+
+	/** Pointer to the first untransmitted byte of the tx buffer */
+	struct iobuf_cursor tx_edge;
+
+	/** List of segments within the window */
+	struct list_head tx_segments;
+
 	/** Receive queue */
 	struct list_head rx_queue;
 	/** Transmission process */
@@ -128,14 +148,6 @@ struct tcp_connection {
 	/** Pending operations for transmit queue */
 	struct pending_operation pending_data;
 };
-
-/*
- * Comparing sequence numbers isn't just comparing unsigned integers,
- * as these wrap around.
- */
-
-#define SEQ_LT( a, b )	( ( int )( ( a ) - ( b ) ) < 0 )
-#define SEQ_LEQ( a, b )	( ( int )( ( a ) - ( b ) ) <= 0 )
 
 static size_t tcp_inflight ( struct tcp_connection * conn ) {
 	return conn->snd_una - conn->snd_nxt;
@@ -333,6 +345,7 @@ static int tcp_finalize_open ( struct tcp_connection *tcp,
 	tcp->prev_tcp_state = TCP_CLOSED;
 	tcp_dump_state ( tcp );
 	INIT_LIST_HEAD ( &tcp->tx_queue );
+	INIT_LIST_HEAD ( &tcp->tx_segments );
 	INIT_LIST_HEAD ( &tcp->rx_queue );
 	memcpy ( &tcp->peer, st_peer, sizeof ( tcp->peer ) );
 
@@ -518,7 +531,10 @@ int tcp_listen ( struct interface * xfer, struct sockaddr * local ) {
  */
 static void tcp_close ( struct tcp_connection *tcp, int rc ) {
 	struct io_buffer *iobuf;
-	struct io_buffer *tmp;
+	struct io_buffer *tmp_buf;
+
+	struct tcp_segment *seg;
+	struct tcp_segment *tmp_seg;
 
 	/* Close data transfer interface */
 	intf_shutdown ( &tcp->xfer, rc );
@@ -535,18 +551,25 @@ static void tcp_close ( struct tcp_connection *tcp, int rc ) {
 		tcp_dump_state ( tcp );
 
 		/* Free any unprocessed I/O buffers */
-		list_for_each_entry_safe ( iobuf, tmp, &tcp->rx_queue, list ) {
+		list_for_each_entry_safe ( iobuf, tmp_buf,
+                                           &tcp->rx_queue, list ) {
 			list_del ( &iobuf->list );
 			free_iob ( iobuf );
 		}
 
 		/* Free any unsent I/O buffers */
-		list_for_each_entry_safe ( iobuf, tmp, &tcp->tx_queue, list ) {
+		list_for_each_entry_safe ( iobuf, tmp_buf, &tcp->tx_queue, list ) {
 			list_del ( &iobuf->list );
 			free_iob ( iobuf );
 			pending_put ( &tcp->pending_data );
 		}
 		assert ( ! is_pending ( &tcp->pending_data ) );
+
+		/* Free any unacknowledged segment metadata */
+		list_for_each_entry_safe ( seg, tmp_seg, &tcp->tx_segments, list ) {
+			list_del ( &seg->list );
+			free ( seg );
+		}
 
 		/* Remove pending operations for SYN and FIN, if applicable */
 		pending_put ( &tcp->pending_flags );
@@ -621,13 +644,12 @@ static size_t tcp_xmit_win ( struct tcp_connection *tcp ) {
  * @ret len		Length of window
  */
 static size_t tcp_xfer_window ( struct tcp_connection *tcp ) {
-
 	/* Not ready if data queue is non-empty.  This imposes a limit
 	 * of only one unACKed packet in the TX queue at any time; we
 	 * do this to conserve memory usage.
 	 */
-	if ( ! list_empty ( &tcp->tx_queue ) )
-		return 0;
+	/* if ( ! list_empty ( &tcp->tx_queue ) ) */
+	/* 	return 0; */
 
 	/* Return TCP window length */
 	return tcp_xmit_win ( tcp );
@@ -722,61 +744,148 @@ static unsigned int tcp_sack ( struct tcp_connection *tcp, uint32_t seq ) {
 }
 
 /**
- * Process TCP transmit queue
+ * Process TCP transmit buffer
  *
  * @v tcp		TCP connection
- * @v max_len		Maximum length to process
+ * @v cursor		Buffer and offset to start processing from
  * @v dest		I/O buffer to fill with data, or NULL
- * @v remove		Remove data from queue
+ * @v move_cursor	Whether to move the cursor to the end of processed data
  * @ret len		Length of data processed
  *
- * This processes at most @c max_len bytes from the TCP connection's
- * transmit queue.  Data will be copied into the @c dest I/O buffer
- * (if provided) and, if @c remove is true, removed from the transmit
- * queue.
+ * This copies data from the TCP connection's transmit buffer pointed to by
+ * some @c segment.  Data will be copied into the @c dest I/O buffer.
  */
-static size_t tcp_process_tx_queue ( struct tcp_connection *tcp, size_t max_len,
-				     struct io_buffer *dest, int remove ) {
+static size_t tcp_process_tx_queue ( struct tcp_connection *tcp,
+				      struct iobuf_cursor *cursor,
+				      size_t max_len, struct io_buffer *dest,
+				      bool move_cursor ) {
 	struct io_buffer *iobuf;
-	struct io_buffer *tmp;
+	size_t offset;
 	size_t frag_len;
 	size_t len = 0;
 
-	list_for_each_entry_safe ( iobuf, tmp, &tcp->tx_queue, list ) {
+	offset = cursor->offset;
+	iobuf = cursor->iobuf;
+
+	list_for_each_entry_continue_at ( iobuf, &tcp->tx_queue, list ) {
 		frag_len = iob_len ( iobuf );
+		assert ( frag_len > offset );
+		frag_len -= offset;
+
 		if ( frag_len > max_len )
 			frag_len = max_len;
+
 		if ( dest ) {
-			memcpy ( iob_put ( dest, frag_len ), iobuf->data,
-				 frag_len );
+			memcpy ( iob_put ( dest, frag_len ),
+				 ( char * )iobuf->data + offset, frag_len );
 		}
-		if ( remove ) {
-			iob_pull ( iobuf, frag_len );
-			if ( ! iob_len ( iobuf ) ) {
-				list_del ( &iobuf->list );
-				free_iob ( iobuf );
-				pending_put ( &tcp->pending_data );
+
+		/* Not moving the cursor for each buffer is more complicated,
+		 * and requires some more variables. Let's keep it simple */
+		if ( move_cursor ) {
+			if ( frag_len + offset == iob_len ( iobuf ) ) {
+				cursor->iobuf = list_next_entry (
+				    iobuf, &tcp->tx_queue, list );
+				cursor->offset = 0;
+			} else {
+				cursor->iobuf = iobuf;
+				cursor->offset = frag_len;
 			}
 		}
+
+		/* There can only be an offset on the first block */
+		offset = 0;
 		len += frag_len;
 		max_len -= frag_len;
+
+		if ( max_len == 0 )
+			break;
 	}
+
+	DBGC2 ( tcp, "TCP %p processed queue%s%s %zd\n", tcp,
+		dest ? " copied data" : "",
+		move_cursor ? " and moved cursor" : "", len );
 	return len;
 }
 
-/**
- * Transmit any outstanding data (with selective acknowledgement)
- *
- * @v tcp		TCP connection
- * @v sack_seq		SEQ for first selective acknowledgement (if any)
- *
- * Transmits any outstanding data on the connection.
- *
- * Note that even if an error is returned, the retransmission timer
- * will have been started if necessary, and so the stack will
- * eventually attempt to retransmit the failed packet.
- */
-static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
+static struct tcp_segment *
+tcp_prepare_tx_segment ( struct tcp_connection * tcp, size_t max_len ) {
+	size_t segment_size;
+	struct tcp_segment *segment;
+	struct iobuf_cursor previous_edge;
+
+	if ( tcp->tx_edge.iobuf == NULL )
+		return NULL;
+
+	/* The previous right edge of the window is the lower
+	   limit of the new segment*/
+	previous_edge = tcp->tx_edge;
+
+	segment_size = tcp_process_tx_queue ( tcp, &tcp->tx_edge,
+					       max_len, NULL, true );
+
+	/* tx_edge shouldn't point to the last byte, but rather be NULL */
+	assert ( segment_size != 0 );
+
+	segment = zalloc ( sizeof ( *segment ) );
+	if ( segment == NULL ) {
+		goto err_alloc;
+	}
+
+	DBGC2 ( tcp, "TCP %p prepared a new segment with size %zd\n", tcp,
+		segment_size );
+	segment->size = segment_size;
+	segment->seq = tcp->snd_nxt;
+	segment->buffer = previous_edge;
+	list_add_tail ( &segment->list, &tcp->tx_segments );
+
+	return segment;
+
+err_alloc:
+	tcp->tx_edge = previous_edge;
+	return NULL;
+}
+
+/* Free any acknowledged segment and associated buffers */
+void tcp_trim_tx_queue ( struct tcp_connection *tcp ) {
+	struct tcp_segment *seg;
+	struct tcp_segment *next_seg;
+
+	struct io_buffer *bound_buf;
+	struct io_buffer *next_bound_buf;
+	struct io_buffer *tmp;
+
+	list_for_each_entry_safe ( seg, next_seg, &tcp->tx_segments, list ) {
+		if ( ! seg->acknowledged )
+			break;
+
+		bound_buf = seg->buffer.iobuf;
+
+		/* next_bound_buf is the next useful buffer, or NULL */
+		next_bound_buf =
+		    next_seg ? next_seg->buffer.iobuf : tcp->tx_edge.iobuf;
+
+		/* Free buffers until the next useful buffer is found */
+		while ( bound_buf != next_bound_buf ) {
+
+			tmp = list_next_entry ( bound_buf, &tcp->tx_queue, list );
+
+			/* Free the current buffer */
+			list_del ( &bound_buf->list );
+			free_iob ( bound_buf );
+			pending_put ( &tcp->pending_data );
+
+			bound_buf = tmp;
+		}
+
+		/* Free the segment */
+		list_del ( &seg->list );
+		free ( seg );
+	}
+}
+
+static void tcp_xmit_segment ( struct tcp_connection *tcp, uint32_t sack_seq,
+			       struct tcp_segment *segment ) {
 	struct io_buffer *iobuf;
 	struct tcp_header *tcphdr;
 	struct tcp_mss_option *mssopt;
@@ -802,9 +911,8 @@ static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
 	/* Calculate both the actual (payload) and sequence space
 	 * lengths that we wish to transmit.
 	 */
-	if ( TCP_CAN_SEND_DATA ( tcp->tcp_state ) ) {
-		len = tcp_process_tx_queue ( tcp, tcp_xmit_win ( tcp ),
-					     NULL, 0 );
+	if ( TCP_CAN_SEND_DATA ( tcp->tcp_state ) && segment != NULL ) {
+		len = segment->size;
 	}
 	seq_len = len;
 
@@ -827,8 +935,8 @@ static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
 	 * allocate the I/O buffer, in case allocation itself fails.
 	 */
 	/* if ( seq_len ) */
-	/* 	start_timer ( &tcp->timer ); *
-                /
+	/* 	start_timer ( &tcp->timer ); */
+
 	/* Allocate I/O buffer */
 	iobuf = alloc_iob ( len + TCP_MAX_HEADER_LEN );
 	if ( ! iobuf ) {
@@ -840,7 +948,9 @@ static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
 	iob_reserve ( iobuf, TCP_MAX_HEADER_LEN );
 
 	/* Fill data payload from transmit queue */
-	tcp_process_tx_queue ( tcp, len, iobuf, 0 );
+	if ( segment )
+		tcp_process_tx_queue ( tcp, &segment->buffer, segment->size, iobuf,
+				       false );
 
 	/* Expand receive window if possible */
 	max_rcv_win = xfer_window ( &tcp->xfer );
@@ -934,6 +1044,31 @@ static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
 	tcp->flags &= ~TCP_ACK_PENDING;
 
 	profile_stop ( &tcp_tx_profiler );
+}
+
+/**
+ * Transmit any outstanding data (with selective acknowledgement)
+ *
+ * @v tcp		TCP connection
+ * @v sack_seq		SEQ for first selective acknowledgement (if any)
+ *
+ * Transmits any outstanding data on the connection.
+ *
+ * Note that even if an error is returned, the retransmission timer
+ * will have been started if necessary, and so the stack will
+ * eventually attempt to retransmit the failed packet.
+ */
+static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
+	struct tcp_segment *segment;
+        size_t win = tcp_xmit_win ( tcp );
+
+        /* TODO: check for timeouts */
+
+	/* Select what data to transmit. Try to transmit even if there's no data
+	   to transfer, as an SYN / ACK / FIN may be needed */
+	segment = tcp_prepare_tx_segment ( tcp, win );
+
+	tcp_xmit_segment ( tcp, sack_seq, segment );
 }
 
 /**
@@ -1348,7 +1483,7 @@ static int tcp_rx_ack ( struct tcp_connection *tcp, uint32_t ack,
 	tcp->snd_una = ack;
 
 	/* Remove any acknowledged data from transmit queue */
-	tcp_process_tx_queue ( tcp, len, NULL, 1 );
+	tcp_trim_tx_queue ( tcp );
 
 	/* Mark SYN/FIN as acknowledged if applicable. */
 	if ( acked_flags )
@@ -1919,9 +2054,25 @@ static void tcp_xfer_close ( struct tcp_connection *tcp, int rc ) {
 static int tcp_xfer_deliver ( struct tcp_connection *tcp,
 			      struct io_buffer *iobuf,
 			      struct xfer_metadata *meta __unused ) {
+	/* Delivering zero-sized buffers adds a whole bunch of
+	   corner cases for no obvious benefit */
+	assert ( iob_len ( iobuf ) != 0 );
 
-	/* Enqueue packet */
+	/* Don't let the implementation break if it happens */
+	if ( iob_len ( iobuf ) == 0 ) {
+		free_iob ( iobuf );
+		return 0;
+	}
+
+	/* Enqueue buffer */
 	list_add_tail ( &iobuf->list, &tcp->tx_queue );
+
+	/* When the tx buffer is empty, it has no edge. Initialize
+	   it when it occurs */
+	if ( tcp->tx_edge.iobuf == NULL ) {
+		tcp->tx_edge.iobuf = iobuf;
+		tcp->tx_edge.offset = 0;
+	}
 
 	/* Each enqueued packet is a pending operation */
 	pending_get ( &tcp->pending_data );

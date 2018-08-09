@@ -466,6 +466,18 @@ extern void extern_list_splice_tail_init ( struct list_head *list,
 	      pos = list_entry ( pos->member.next, typeof ( *pos ), member ) )
 
 /**
+ * Iterate over entries in a list, starting at current position
+ *
+ * @v pos		Iterator
+ * @v head		List head
+ * @v member		Name of list field within iterator's type
+ */
+#define list_for_each_entry_continue_at( pos, head, member )		      \
+	for ( list_check ( (head) );					      \
+	      &pos->member != (head);					      \
+	      pos = list_entry ( pos->member.next, typeof ( *pos ), member ) )
+
+/**
  * Iterate over entries in a list in reverse, starting after current position
  *
  * @v pos		Iterator
