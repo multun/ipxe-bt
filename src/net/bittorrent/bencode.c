@@ -11,8 +11,8 @@ static void bencode_free_dict ( struct bdict * cur ) {
 	for ( struct bdict *prev = NULL; cur || prev;
 	      prev = cur, !cur || ( cur = cur->next ) )
 		if ( prev ) {
-			bencode_free ( cur->key );
-			bencode_free ( cur->value );
+			bencode_free ( prev->key );
+			bencode_free ( prev->value );
 			free ( prev );
 		}
 }

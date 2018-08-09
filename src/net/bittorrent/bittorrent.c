@@ -256,6 +256,8 @@ static void torrent_announce_finished ( struct torrent *torrent, int rc ) {
 	     0 )
 		goto err_parse_peers;
 
+	bencode_free ( response );
+
 	/* reset the buffer for next announces */
 	xferbuf_free ( &torrent->tracker_response );
 	memset ( &torrent->tracker_response, 0,

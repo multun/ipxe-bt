@@ -118,6 +118,7 @@ static void btclient_free ( struct refcnt * refcnt ) {
 
 	DBGC ( client, "BTCLIENT %p freed\n", client );
 
+	bitset_free ( &client->announced_pieces );
 	torrent_client_free ( &client->base_client );
 	free ( client );
 }
