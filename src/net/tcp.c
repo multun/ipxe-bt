@@ -28,18 +28,83 @@
 
 FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
 
+/** @page tcp_implementation TCP Implementation details
+ *
+ * ipxe's TCP stack supports SACK, timestamps, and is usualy mostly used for
+ * receiving data. It means the tx side should be kept minimal unless it needs
+ * to be more efficient.
+ *
+ * Here's what the tx queue looks like:
+ *
+ * @code
+ *
+ *   +-------+   +------+    +-------+   +------+
+ *   |ACK    |   |ACKed |    |ACK    |   |tx    |                  tx_segments
+ *   |pending|   |      |    |pending|   |queued|
+ *   +-------+   +------+    +-------+   +------+_
+ *   !       \ /         \   !        \  !        '-,   tx_edge
+ *   !        !            \ !          \!           '-, !
+ *   !        !              !           !              '!
+ *   +-----------------+ +---------------------------------------+
+ *   |                 | |                                       | tx_data_queue
+ *   |                 | |                                       |
+ *   +-----------------+ +---------------------------------------+
+ *
+ * @endcode
+ *
+ */
+
+/** A pointer to some byte of an io_buffer */
 struct iobuf_cursor {
 	struct io_buffer *iobuf;
 	size_t offset;
 };
 
-struct tcp_segment {
+/** A segment awaiting acknowledgement */
+struct tcp_tx_queued_segment {
+	/** List of all segments */
 	struct list_head list;
+	/** Either the tx pending queue, or the ACK pending queue
+	    If the segment was acknowledged, this head isn't in any list, and
+	    must be NULLed out using tcp_segment_mark_acknowledged */
+	struct list_head queue_list;
+	/** Data associated with the segment */
 	struct iobuf_cursor buffer;
+	/** Sequence number of the first byte */
 	uint32_t seq;
-	uint32_t size;
-	bool acknowledged;
+	/** Data length */
+	uint32_t len;
+
+	/** When the segment was last transmitted */
+	uint32_t ts;
+	/** Number of times the segment was transmitted */
+	uint8_t transmission_count;
+
+	/** TCP Flags */
+	uint8_t flags;
 };
+
+static inline void
+tcp_segment_mark_acknowledged ( struct tcp_tx_queued_segment *segment ) {
+        segment->queue_list = ( struct list_head ) { 0 };
+}
+
+static inline bool
+tcp_segment_is_acknowledged ( struct tcp_tx_queued_segment *segment ) {
+	struct list_head *list = &segment->queue_list;
+
+	/* One of the pointers being NULL would denote corruption */
+	assert ( ( list->prev == NULL ) == ( list->next == NULL ) );
+	return list->prev == NULL && list->next == NULL;
+}
+
+static uint32_t tcp_segment_seq_len ( uint32_t len, int flags ) {
+	if ( flags & ( TCP_SYN | TCP_FIN ) ) {
+	        len++;
+	}
+
+	return len;
+}
 
 /** A TCP connection */
 struct tcp_connection {
@@ -123,21 +188,34 @@ struct tcp_connection {
 	/** Selective acknowledgement list (in host-endian order) */
 	struct tcp_sack_block sack[TCP_SACK_MAX];
 
-	/** Transmit queue */
-	struct list_head tx_queue;
-
-	/** Pointer to the first untransmitted byte of the tx buffer */
-	struct iobuf_cursor tx_edge;
+	/** Queue of buffers awaiting transmission, referenced by segments */
+	struct list_head tx_data_queue;
 
 	/** List of segments within the window */
 	struct list_head tx_segments;
+
+	/** Queue of segments awaiting transmission */
+	struct list_head tx_queue;
+
+	/** Queue of segments to check for retransmission */
+	struct list_head tx_ack_pending;
+
+	/** Pointer to the first unsegmented byte of the tx buffer */
+	struct iobuf_cursor tx_unsegmented;
+
+	// TODO: get rid of this, report a window of the size of a segment to the user
+	/** Number of unsegmented bytes, needed to report the actual window */
+	size_t tx_unsegmented_len;
+
+	/* Queued but not yet acknowledged flags */
+	uint8_t tx_queued_flags;
+
+	uint32_t tx_timeout;
 
 	/** Receive queue */
 	struct list_head rx_queue;
 	/** Transmission process */
 	struct process process;
-	/** Retransmission timer */
-	struct retry_timer timer;
 	/** Keepalive timer */
 	struct retry_timer keepalive;
 	/** Shutdown (TIME_WAIT) timer */
@@ -222,7 +300,6 @@ static struct profiler tcp_xfer_profiler __profiler = { .name = "tcp.xfer" };
 /* Forward declarations */
 static struct process_descriptor tcp_process_desc;
 static struct interface_descriptor tcp_xfer_desc;
-static void tcp_expired ( struct retry_timer *timer, int over );
 static void tcp_keepalive_expired ( struct retry_timer *timer, int over );
 static void tcp_wait_expired ( struct retry_timer *timer, int over );
 static struct tcp_connection * tcp_demux ( struct sockaddr_tcpip * local,
@@ -236,7 +313,7 @@ static int tcp_rx_ack ( struct tcp_connection *tcp, uint32_t ack,
  * @v state		TCP state
  * @ret name		Name of TCP state
  */
-static inline __attribute__ (( always_inline )) const char *
+static inline /* __attribute__ (( always_inline ))  */const char *
 tcp_state ( int state ) {
 	switch ( state ) {
 	case TCP_CLOSED:		return "CLOSED";
@@ -257,7 +334,7 @@ tcp_state ( int state ) {
  *
  * @v tcp		TCP connection
  */
-static inline __attribute__ (( always_inline )) void
+static inline /* __attribute__ (( always_inline ))  */void
 tcp_dump_state ( struct tcp_connection *tcp ) {
 
 	if ( tcp->tcp_state != tcp->prev_tcp_state ) {
@@ -339,15 +416,17 @@ static int tcp_finalize_open ( struct tcp_connection *tcp,
 	ref_init ( &tcp->refcnt, NULL );
 	intf_init ( &tcp->xfer, &tcp_xfer_desc, &tcp->refcnt );
 	process_init_stopped ( &tcp->process, &tcp_process_desc, &tcp->refcnt );
-	timer_init ( &tcp->timer, tcp_expired, &tcp->refcnt );
 	timer_init ( &tcp->keepalive, tcp_keepalive_expired, &tcp->refcnt );
 	timer_init ( &tcp->wait, tcp_wait_expired, &tcp->refcnt );
 	tcp->prev_tcp_state = TCP_CLOSED;
 	tcp_dump_state ( tcp );
-	INIT_LIST_HEAD ( &tcp->tx_queue );
 	INIT_LIST_HEAD ( &tcp->tx_segments );
+	INIT_LIST_HEAD ( &tcp->tx_queue );
+	INIT_LIST_HEAD ( &tcp->tx_data_queue );
+	INIT_LIST_HEAD ( &tcp->tx_ack_pending );
 	INIT_LIST_HEAD ( &tcp->rx_queue );
 	memcpy ( &tcp->peer, st_peer, sizeof ( tcp->peer ) );
+	tcp->tx_timeout = TCP_MSL; // TODO: RTFM
 
 	/* Calculate MSS */
 	mtu = tcpip_mtu ( &tcp->peer );
@@ -359,8 +438,8 @@ static int tcp_finalize_open ( struct tcp_connection *tcp,
 	}
 	tcp->mss = ( mtu - sizeof ( struct tcp_header ) );
 
-	/* Start timer to initiate SYN */
-	start_timer_nodelay ( &tcp->timer );
+	/* Start sending process to initiate SYN */
+        process_add ( &tcp->process );
 
 	/* Add a pending operation for the SYN */
 	pending_get ( &tcp->pending_flags );
@@ -533,8 +612,8 @@ static void tcp_close ( struct tcp_connection *tcp, int rc ) {
 	struct io_buffer *iobuf;
 	struct io_buffer *tmp_buf;
 
-	struct tcp_segment *seg;
-	struct tcp_segment *tmp_seg;
+	struct tcp_tx_queued_segment *seg;
+	struct tcp_tx_queued_segment *tmp_seg;
 
 	/* Close data transfer interface */
 	intf_shutdown ( &tcp->xfer, rc );
@@ -558,17 +637,20 @@ static void tcp_close ( struct tcp_connection *tcp, int rc ) {
 		}
 
 		/* Free any unsent I/O buffers */
-		list_for_each_entry_safe ( iobuf, tmp_buf, &tcp->tx_queue, list ) {
+		list_for_each_entry_safe ( iobuf, tmp_buf, &tcp->tx_data_queue, list ) {
 			list_del ( &iobuf->list );
-			free_iob ( iobuf );
+			/* free_iob ( iobuf ); */ // TODO: remove debug
 			pending_put ( &tcp->pending_data );
 		}
 		assert ( ! is_pending ( &tcp->pending_data ) );
 
-		/* Free any unacknowledged segment metadata */
+		/* Free all segments */
 		list_for_each_entry_safe ( seg, tmp_seg, &tcp->tx_segments, list ) {
+			/* No SYN, no ACKed segment */
+			assert ( ! tcp_segment_is_acknowledged ( seg ) );
+			list_del ( &seg->queue_list );
 			list_del ( &seg->list );
-			free ( seg );
+			/* free ( seg ); */ // TODO: remove debug
 		}
 
 		/* Remove pending operations for SYN and FIN, if applicable */
@@ -577,7 +659,6 @@ static void tcp_close ( struct tcp_connection *tcp, int rc ) {
 
 		/* Remove from list and drop reference */
 		process_del ( &tcp->process );
-		stop_timer ( &tcp->timer );
 		stop_timer ( &tcp->keepalive );
 		stop_timer ( &tcp->wait );
 		list_del ( &tcp->list );
@@ -597,7 +678,7 @@ static void tcp_close ( struct tcp_connection *tcp, int rc ) {
 	stop_timer ( &tcp->keepalive );
 
 	/* If we have no data remaining to send, start sending FIN */
-	if ( list_empty ( &tcp->tx_queue ) &&
+	if ( list_empty ( &tcp->tx_data_queue ) &&
 	     ! ( tcp->tcp_state & TCP_STATE_SENT ( TCP_FIN ) ) ) {
 
 		tcp->tcp_state |= TCP_STATE_SENT ( TCP_FIN );
@@ -623,18 +704,19 @@ static void tcp_close ( struct tcp_connection *tcp, int rc ) {
  * @ret len		Maximum length that can be sent in a single packet
  */
 static size_t tcp_xmit_win ( struct tcp_connection *tcp ) {
-	size_t len;
+	uint32_t win_seq_limit;
 
 	/* Not ready if we're not in a suitable connection state */
 	if ( ! TCP_CAN_SEND_DATA ( tcp->tcp_state ) )
 		return 0;
 
-	/* Length is the minimum of the receiver's window and the path MTU */
-	len = tcp->snd_win;
-	if ( len > TCP_PATH_MTU )
-		len = TCP_PATH_MTU;
+	/* Compute the sequence number of the right edge of the window */
+	win_seq_limit = tcp->snd_una + tcp->snd_win;
 
-	return len;
+	/* TODO: The window _shouldn't_ shrink. Either RST or implement proper trimming */
+	assert ( tcp_cmp ( tcp->snd_nxt, win_seq_limit ) <= 0 );
+
+	return win_seq_limit - tcp->snd_nxt;
 }
 
 /**
@@ -651,8 +733,12 @@ static size_t tcp_xfer_window ( struct tcp_connection *tcp ) {
 	/* if ( ! list_empty ( &tcp->tx_queue ) ) */
 	/* 	return 0; */
 
-	/* Return TCP window length */
-	return tcp_xmit_win ( tcp );
+	uint32_t win = tcp_xmit_win ( tcp );
+	uint32_t queued = tcp->tx_unsegmented_len;
+	if ( queued > win )
+		return 0;
+
+	return win - queued;
 }
 
 /**
@@ -748,6 +834,7 @@ static unsigned int tcp_sack ( struct tcp_connection *tcp, uint32_t seq ) {
  *
  * @v tcp		TCP connection
  * @v cursor		Buffer and offset to start processing from
+ * @v max_len		Max amount of data to process
  * @v dest		I/O buffer to fill with data, or NULL
  * @v move_cursor	Whether to move the cursor to the end of processed data
  * @ret len		Length of data processed
@@ -767,7 +854,7 @@ static size_t tcp_process_tx_queue ( struct tcp_connection *tcp,
 	offset = cursor->offset;
 	iobuf = cursor->iobuf;
 
-	list_for_each_entry_continue_at ( iobuf, &tcp->tx_queue, list ) {
+	list_for_each_entry_continue_at ( iobuf, &tcp->tx_data_queue, list ) {
 		frag_len = iob_len ( iobuf );
 		assert ( frag_len > offset );
 		frag_len -= offset;
@@ -783,13 +870,14 @@ static size_t tcp_process_tx_queue ( struct tcp_connection *tcp,
 		/* Not moving the cursor for each buffer is more complicated,
 		 * and requires some more variables. Let's keep it simple */
 		if ( move_cursor ) {
-			if ( frag_len + offset == iob_len ( iobuf ) ) {
+			offset += frag_len;
+			if ( offset == iob_len ( iobuf ) ) {
 				cursor->iobuf = list_next_entry (
-				    iobuf, &tcp->tx_queue, list );
+				    iobuf, &tcp->tx_data_queue, list );
 				cursor->offset = 0;
 			} else {
 				cursor->iobuf = iobuf;
-				cursor->offset = frag_len;
+				cursor->offset = offset;
 			}
 		}
 
@@ -802,73 +890,134 @@ static size_t tcp_process_tx_queue ( struct tcp_connection *tcp,
 			break;
 	}
 
-	DBGC2 ( tcp, "TCP %p processed queue%s%s %zd\n", tcp,
-		dest ? " copied data" : "",
+	DBGC2 ( tcp, "TCP %p processed queue%s%s %zd bytes\n", tcp,
+		dest ? " copied" : "",
 		move_cursor ? " and moved cursor" : "", len );
 	return len;
 }
 
-static struct tcp_segment *
-tcp_prepare_tx_segment ( struct tcp_connection * tcp, size_t max_len ) {
-	size_t segment_size;
-	struct tcp_segment *segment;
+/* returns the number of created segments, or a negative error code */
+static int tcp_prepare_tx_segment ( struct tcp_connection *tcp,
+				    size_t max_len ) {
+	struct tcp_tx_queued_segment *segment;
 	struct iobuf_cursor previous_edge;
+	size_t segment_len = 0;
+	size_t seq_len;
+	int flags;
+	int rc;
 
-	if ( tcp->tx_edge.iobuf == NULL )
-		return NULL;
+	flags = ( TCP_FLAGS_SENDING ( tcp->tcp_state ) &
+		  ~tcp->tx_queued_flags );
+
+	/* SYN or FIN consume one byte, and we can never send both */
+	assert ( !( ( flags & TCP_SYN ) && ( flags & TCP_FIN ) ) );
 
 	/* The previous right edge of the window is the lower
 	   limit of the new segment*/
-	previous_edge = tcp->tx_edge;
+	previous_edge = tcp->tx_unsegmented;
 
-	segment_size = tcp_process_tx_queue ( tcp, &tcp->tx_edge,
-					       max_len, NULL, true );
+	if ( tcp->tx_unsegmented.iobuf != NULL
+	     && TCP_CAN_SEND_DATA ( tcp->tcp_state ) )
+		segment_len = tcp_process_tx_queue ( tcp, &tcp->tx_unsegmented,
+						     max_len, NULL, true );
 
-	/* tx_edge shouldn't point to the last byte, but rather be NULL */
-	assert ( segment_size != 0 );
+	seq_len = tcp_segment_seq_len ( segment_len, flags );
+	/* No need to queue a retransmissible frame if no sequence space */
+	if ( seq_len == 0 )
+		return 0;
 
 	segment = zalloc ( sizeof ( *segment ) );
 	if ( segment == NULL ) {
+		rc = -ENOMEM;
 		goto err_alloc;
 	}
 
-	DBGC2 ( tcp, "TCP %p prepared a new segment with size %zd\n", tcp,
-		segment_size );
-	segment->size = segment_size;
+	if ( segment_len ) {
+		segment->buffer = previous_edge;
+	}
+	DBGC2 ( segment, "TCP_SEGMENT %p bound to TCP %p (%p + %zd) #%zd\n",
+		segment, tcp, segment->buffer.iobuf, segment->buffer.offset,
+		segment_len );
+	segment->len = segment_len;
 	segment->seq = tcp->snd_nxt;
-	segment->buffer = previous_edge;
-	list_add_tail ( &segment->list, &tcp->tx_segments );
 
-	return segment;
+	tcp->tx_unsegmented_len -= segment_len;
+
+	/* Increase the sequence cursor */
+	tcp->snd_nxt += seq_len;
+
+	segment->flags = flags;
+	list_add_tail ( &segment->list, &tcp->tx_segments );
+	list_add_tail ( &segment->queue_list, &tcp->tx_queue );
+
+	/* Avoid sending these flags again until the packet is ACKed */
+	tcp->tx_queued_flags |= flags & ( TCP_SYN | TCP_FIN );
+
+	return 1;
 
 err_alloc:
-	tcp->tx_edge = previous_edge;
-	return NULL;
+	tcp->tx_unsegmented = previous_edge;
+	return rc;
+}
+
+static void tcp_register_ack ( struct tcp_connection * tcp, uint32_t ack,
+			       uint32_t sack_left, uint32_t sack_right ) {
+	struct tcp_tx_queued_segment * segment;
+	uint32_t seq;
+	uint32_t seq_end;
+	uint32_t seq_len;
+
+	list_for_each_entry ( segment, &tcp->tx_segments, list ) {
+		seq = segment->seq;
+		seq_len = tcp_segment_seq_len ( segment->len, segment->flags );
+		seq_end = seq + seq_len;
+
+		if ( segment->transmission_count == 0 )
+			continue;
+
+		if ( tcp_cmp ( ack, seq_end ) >= 0 ||
+		     /* TODO: ensure this is ok */
+		     ( tcp_cmp ( sack_left, seq ) <= 0 &&
+		       tcp_cmp ( sack_right, seq_end ) >= 0 ) ) {
+			DBGC2 ( segment, "TCP_SEGMENT %p marked as "
+				"acknowledged\n", segment );
+			/* Remove the segment from the retransmission queue */
+			list_del ( &segment->queue_list );
+
+			/* Mark the segment as acknowledged */
+			tcp_segment_mark_acknowledged ( segment );
+		}
+	}
 }
 
 /* Free any acknowledged segment and associated buffers */
-void tcp_trim_tx_queue ( struct tcp_connection *tcp ) {
-	struct tcp_segment *seg;
-	struct tcp_segment *next_seg;
+static void tcp_trim_tx_queue ( struct tcp_connection *tcp ) {
+	struct tcp_tx_queued_segment *seg;
+	struct tcp_tx_queued_segment *next_seg;
 
 	struct io_buffer *bound_buf;
 	struct io_buffer *next_bound_buf;
 	struct io_buffer *tmp;
 
 	list_for_each_entry_safe ( seg, next_seg, &tcp->tx_segments, list ) {
-		if ( ! seg->acknowledged )
+		if ( ! tcp_segment_is_acknowledged ( seg ) )
 			break;
 
 		bound_buf = seg->buffer.iobuf;
 
 		/* next_bound_buf is the next useful buffer, or NULL */
 		next_bound_buf =
-		    next_seg ? next_seg->buffer.iobuf : tcp->tx_edge.iobuf;
+		    list_is_last_entry ( seg, &tcp->tx_segments, list )
+			? tcp->tx_unsegmented.iobuf
+			: next_seg->buffer.iobuf;
 
 		/* Free buffers until the next useful buffer is found */
-		while ( bound_buf != next_bound_buf ) {
+		while ( bound_buf != NULL && bound_buf != next_bound_buf ) {
 
-			tmp = list_next_entry ( bound_buf, &tcp->tx_queue, list );
+			tmp = list_next_entry ( bound_buf, &tcp->tx_data_queue,
+						list );
+
+			DBGC2 ( seg, "TCP_SEGMENT buffer %p freed\n", bound_buf );
 
 			/* Free the current buffer */
 			list_del ( &bound_buf->list );
@@ -878,14 +1027,23 @@ void tcp_trim_tx_queue ( struct tcp_connection *tcp ) {
 			bound_buf = tmp;
 		}
 
-		/* Free the segment */
+		DBGC2 ( seg, "TCP_SEGMENT %p freed\n", seg );
+
+		/* The segment was acknowledged, so no need to remove it
+		   from its tx_queue or tx_ack_pending */
+
+                /* The flags the segment holds were acknowledged */
+		tcp->tx_queued_flags &= ~seg->flags;
+
+		/* Remove the segment from tx_segments */
 		list_del ( &seg->list );
+		/* Free the segment */
 		free ( seg );
 	}
 }
 
-static void tcp_xmit_segment ( struct tcp_connection *tcp, uint32_t sack_seq,
-			       struct tcp_segment *segment ) {
+static int tcp_xmit_segment ( struct tcp_connection *tcp, uint32_t sack_seq,
+			      struct tcp_tx_queued_segment *segment ) {
 	struct io_buffer *iobuf;
 	struct tcp_header *tcphdr;
 	struct tcp_mss_option *mssopt;
@@ -898,11 +1056,12 @@ static void tcp_xmit_segment ( struct tcp_connection *tcp, uint32_t sack_seq,
 	unsigned int flags;
 	unsigned int sack_count;
 	unsigned int i;
-	size_t len = 0;
+	size_t len;
 	size_t sack_len;
 	uint32_t seq_len;
 	uint32_t max_rcv_win;
 	uint32_t max_representable_win;
+	uint32_t ts;
 	int rc;
 
 	/* Start profiling */
@@ -911,23 +1070,9 @@ static void tcp_xmit_segment ( struct tcp_connection *tcp, uint32_t sack_seq,
 	/* Calculate both the actual (payload) and sequence space
 	 * lengths that we wish to transmit.
 	 */
-	if ( TCP_CAN_SEND_DATA ( tcp->tcp_state ) && segment != NULL ) {
-		len = segment->size;
-	}
-	seq_len = len;
-
-	/* Each state holds pending flags, such as FIN or SYN */
-	flags = TCP_FLAGS_SENDING ( tcp->tcp_state );
-
-	if ( flags & ( TCP_SYN | TCP_FIN ) ) {
-		/* SYN or FIN consume one byte, and we can never send both */
-		assert ( ! ( ( flags & TCP_SYN ) && ( flags & TCP_FIN ) ) );
-		seq_len++;
-	}
-
-	/* If we have nothing to transmit, stop now */
-	if ( ( seq_len == 0 ) && ! ( tcp->flags & TCP_ACK_PENDING ) )
-		return;
+	len = segment->len;
+	seq_len = tcp_segment_seq_len ( len, segment->flags );
+	flags = segment->flags;
 
 	/* If we are transmitting anything that requires
 	 * acknowledgement (i.e. consumes sequence space), start the
@@ -943,14 +1088,15 @@ static void tcp_xmit_segment ( struct tcp_connection *tcp, uint32_t sack_seq,
 		DBGC ( tcp, "TCP %p could not allocate iobuf for %08x..%08x "
 		       "%08x\n", tcp, tcp->snd_una, ( tcp->snd_una + seq_len ),
 		       tcp->rcv_ack );
-		return;
+		return -ENOMEM;
 	}
 	iob_reserve ( iobuf, TCP_MAX_HEADER_LEN );
 
 	/* Fill data payload from transmit queue */
-	if ( segment )
-		tcp_process_tx_queue ( tcp, &segment->buffer, segment->size, iobuf,
-				       false );
+	if ( segment->len ) {
+		tcp_process_tx_queue ( tcp, &segment->buffer, segment->len,
+				       iobuf, false );
+	}
 
 	/* Expand receive window if possible */
 	max_rcv_win = xfer_window ( &tcp->xfer );
@@ -962,6 +1108,9 @@ static void tcp_xmit_segment ( struct tcp_connection *tcp, uint32_t sack_seq,
 	max_rcv_win &= ~0x03; /* Keep everything dword-aligned */
 	if ( tcp->rcv_win < max_rcv_win )
 		tcp->rcv_win = max_rcv_win;
+
+	/* Save the startup time */
+	ts = currticks ();
 
 	/* Fill up the TCP header */
 	payload = iobuf->data;
@@ -985,7 +1134,7 @@ static void tcp_xmit_segment ( struct tcp_connection *tcp, uint32_t sack_seq,
 		memset ( tsopt->nop, TCP_OPTION_NOP, sizeof ( tsopt->nop ) );
 		tsopt->tsopt.kind = TCP_OPTION_TS;
 		tsopt->tsopt.length = sizeof ( tsopt->tsopt );
-		tsopt->tsopt.tsval = htonl ( currticks() );
+		tsopt->tsopt.tsval = htonl ( ts );
 		tsopt->tsopt.tsecr = htonl ( tcp->ts_recent );
 	}
 	if ( ( tcp->flags & TCP_SACK_ENABLED ) &&
@@ -1009,13 +1158,7 @@ static void tcp_xmit_segment ( struct tcp_connection *tcp, uint32_t sack_seq,
 	memset ( tcphdr, 0, sizeof ( *tcphdr ) );
 	tcphdr->src = htons ( tcp->local_port );
 	tcphdr->dest = tcp->peer.st_port;
-	tcphdr->seq = htonl ( tcp->snd_nxt );
-
-	/* Increase the next sequence number */
-	tcp->snd_nxt += seq_len;
-
-	if ( tcp->snd_nxt > tcp->snd_max )
-		tcp->snd_max = tcp->snd_nxt;
+	tcphdr->seq = htonl ( segment ? segment->seq : tcp->snd_nxt );
 
 	tcphdr->ack = htonl ( tcp->rcv_ack );
 	tcphdr->hlen = ( ( payload - iobuf->data ) << 2 );
@@ -1037,13 +1180,60 @@ static void tcp_xmit_segment ( struct tcp_connection *tcp, uint32_t sack_seq,
 		DBGC ( tcp, "TCP %p could not transmit %08x..%08x %08x: %s\n",
 		       tcp, ntohl ( tcphdr->seq ), tcp->snd_nxt,
 		       tcp->rcv_ack, strerror ( rc ) );
-		return;
+		return rc;
 	}
 
-	/* Clear ACK-pending flag */
-	tcp->flags &= ~TCP_ACK_PENDING;
+	DBGC2 ( segment, "TCP_SEGMENT %p transmitted\n", segment );
+
+	/* Update segment metadata */
+	segment->ts = ts;
+	segment->transmission_count++;
 
 	profile_stop ( &tcp_tx_profiler );
+	return 0;
+}
+
+/* sort of duplicate of the retry timer logic, but enables having a single
+ * timeout for all segments */
+static void tcp_schedule_retransmissions ( struct tcp_connection * tcp ) {
+	struct tcp_tx_queued_segment *segment;
+	uint32_t now = currticks ();
+	uint32_t runtime;
+
+	/* The list of segments awaiting acknowledgement is sorted, oldest
+	   segment first */
+	while ( ( segment = list_first_entry ( &tcp->tx_ack_pending,
+					       struct tcp_tx_queued_segment,
+					       queue_list ) ) != NULL ) {
+		runtime = now - segment->ts;
+		if ( runtime < tcp->tx_timeout )
+			break;
+
+		/** TODO: backoff timeout */
+		/* if ( ++segment->tx_fail_count == 4 ) { */
+		/* 	rc = -ETIMEDOUT; */
+		/* 	tcp->tcp_state = TCP_CLOSED; */
+		/* 	tcp_dump_state ( tcp ); */
+		/* 	tcp_close ( tcp, rc ); */
+		/* 	return rc; */
+		/* } */
+
+		assert ( ( tcp->tcp_state == TCP_SYN_SENT ) ||
+			 ( tcp->tcp_state == TCP_SYN_RCVD ) ||
+			 ( tcp->tcp_state == TCP_ESTABLISHED ) ||
+			 ( tcp->tcp_state == TCP_FIN_WAIT_1 ) ||
+			 ( tcp->tcp_state == TCP_CLOSE_WAIT ) ||
+			 ( tcp->tcp_state == TCP_CLOSING_OR_LAST_ACK ) );
+
+		DBGC ( tcp, "TCP %p retransmission in %s for %08x..%08x %08x\n", tcp,
+		       tcp_state ( tcp->tcp_state ), segment->seq,
+		       tcp_segment_seq_len ( segment->seq, segment->flags ),
+		       tcp->rcv_ack );
+
+		/* Move the segment to the tx queue */
+		list_del ( &segment->queue_list );
+		list_add ( &segment->queue_list, &tcp->tx_queue );
+	}
 }
 
 /**
@@ -1059,16 +1249,62 @@ static void tcp_xmit_segment ( struct tcp_connection *tcp, uint32_t sack_seq,
  * eventually attempt to retransmit the failed packet.
  */
 static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
-	struct tcp_segment *segment;
-        size_t win = tcp_xmit_win ( tcp );
+	struct tcp_tx_queued_segment *segment;
+	struct tcp_tx_queued_segment ack_segment;
+	size_t win;
+	int rc;
 
-        /* TODO: check for timeouts */
+	while ( true ) {
+		win = tcp_xmit_win ( tcp );
 
-	/* Select what data to transmit. Try to transmit even if there's no data
-	   to transfer, as an SYN / ACK / FIN may be needed */
-	segment = tcp_prepare_tx_segment ( tcp, win );
+		if ( win > TCP_PATH_MTU )
+			win = TCP_PATH_MTU;
 
-	tcp_xmit_segment ( tcp, sack_seq, segment );
+		/* Look for candidate retransmissions in the ack_pending queue
+		 */
+		tcp_schedule_retransmissions ( tcp );
+
+		/* If there's no segment ready to be transmitted, try to make
+		 * one */
+		if ( list_empty ( &tcp->tx_queue ) &&
+		     ( rc = tcp_prepare_tx_segment ( tcp, win ) ) < 0 ) {
+			/* Return if something went wrong */
+			return;
+		}
+
+		/* Get the first segment of the tx queue */
+		segment = list_first_entry (
+		    &tcp->tx_queue, struct tcp_tx_queued_segment, queue_list );
+
+		if ( segment != NULL )
+			goto send_segment;
+
+		/* Return if there's no ACK required */
+		if ( !( tcp->flags & TCP_ACK_PENDING ) )
+			return;
+
+		/* Prepare an ACK segment */
+		ack_segment = ( struct tcp_tx_queued_segment ){
+		    .flags = TCP_FLAGS_SENDING ( tcp->tcp_state ),
+		    .seq = tcp->snd_nxt,
+		};
+		segment = &ack_segment;
+
+		/* Transmit the segment. */
+	send_segment:
+		if ( ( rc = tcp_xmit_segment ( tcp, sack_seq, segment ) ) != 0 )
+			return;
+
+		/* Clear ACK-pending flag */
+		tcp->flags &= ~TCP_ACK_PENDING;
+
+		/* Move the segment to the ACK Pending queue */
+		if ( segment != &ack_segment ) {
+			list_del ( &segment->queue_list );
+			list_add_tail ( &segment->queue_list,
+					&tcp->tx_ack_pending );
+		}
+	}
 }
 
 /**
@@ -1085,40 +1321,6 @@ static void tcp_xmit ( struct tcp_connection *tcp ) {
 /** TCP process descriptor */
 static struct process_descriptor tcp_process_desc =
 	PROC_DESC_ONCE ( struct tcp_connection, process, tcp_xmit );
-
-/**
- * Retransmission timer expired
- *
- * @v timer		Retransmission timer
- * @v over		Failure indicator
- */
-static void tcp_expired ( struct retry_timer *timer, int over ) {
-	struct tcp_connection *tcp =
-		container_of ( timer, struct tcp_connection, timer );
-
-	DBGC ( tcp, "TCP %p timer %s in %s for %08x..%08x %08x\n", tcp,
-	       ( over ? "expired" : "fired" ), tcp_state ( tcp->tcp_state ),
-	       tcp->snd_una, tcp->snd_nxt, tcp->rcv_ack );
-
-	assert ( ( tcp->tcp_state == TCP_SYN_SENT ) ||
-		 ( tcp->tcp_state == TCP_SYN_RCVD ) ||
-		 ( tcp->tcp_state == TCP_ESTABLISHED ) ||
-		 ( tcp->tcp_state == TCP_FIN_WAIT_1 ) ||
-		 ( tcp->tcp_state == TCP_CLOSE_WAIT ) ||
-		 ( tcp->tcp_state == TCP_CLOSING_OR_LAST_ACK ) );
-
-	if ( over ) {
-		/* If we have finally timed out and given up,
-		 * terminate the connection
-		 */
-		tcp->tcp_state = TCP_CLOSED;
-		tcp_dump_state ( tcp );
-		tcp_close ( tcp, -ETIMEDOUT );
-	} else {
-		/* Otherwise, retransmit the packet */
-		tcp_xmit ( tcp );
-	}
-}
 
 /**
  * Keepalive timer expired
@@ -1467,8 +1669,7 @@ static int tcp_rx_ack ( struct tcp_connection *tcp, uint32_t ack,
 	if ( ack_len == 0 )
 		return 0;
 
-	/* Stop the retransmission timer */
-	stop_timer ( &tcp->timer );
+	/* TODO: it might be ok to stop the transmission process */
 
 	/* Determine acknowledged flags and data length */
 	len = ack_len;
@@ -1483,6 +1684,7 @@ static int tcp_rx_ack ( struct tcp_connection *tcp, uint32_t ack,
 	tcp->snd_una = ack;
 
 	/* Remove any acknowledged data from transmit queue */
+	tcp_register_ack ( tcp, ack, 0, 0 );
 	tcp_trim_tx_queue ( tcp );
 
 	/* Mark SYN/FIN as acknowledged if applicable. */
@@ -1490,7 +1692,7 @@ static int tcp_rx_ack ( struct tcp_connection *tcp, uint32_t ack,
 		tcp->tcp_state |= TCP_STATE_ACKED ( acked_flags );
 
 	/* Start sending FIN if we've had all possible data ACKed */
-	if ( list_empty ( &tcp->tx_queue ) &&
+	if ( list_empty ( &tcp->tx_data_queue ) &&
 	     ( tcp->flags & TCP_XFER_CLOSED ) &&
 	     ! ( tcp->tcp_state & TCP_STATE_SENT ( TCP_FIN ) ) ) {
 		tcp->tcp_state |= TCP_STATE_SENT ( TCP_FIN );
@@ -1990,7 +2192,6 @@ static struct tcp_connection * tcp_first_unfinished ( void ) {
 static void tcp_shutdown ( int booting __unused ) {
 	struct tcp_connection *tcp;
 	unsigned long start;
-	unsigned long elapsed;
 
 	/* Initiate a graceful close of all connections, allowing for
 	 * the fact that the connection list may change as we do so.
@@ -2002,8 +2203,13 @@ static void tcp_shutdown ( int booting __unused ) {
 
 	/* Wait for all connections to finish closing gracefully */
 	start = currticks();
-	while ( ( tcp = tcp_first_unfinished() ) &&
-		( ( elapsed = ( currticks() - start ) ) < TCP_FINISH_TIMEOUT )){
+	while ( ( tcp = tcp_first_unfinished() ) != NULL ) {
+		if ( ( currticks () - start ) >= TCP_FINISH_TIMEOUT ) {
+			DBG ( "Timed out while waiting for TCP %p to "
+			      "terminate\n",
+			      tcp );
+			break;
+		}
 		step();
 	}
 
@@ -2064,17 +2270,23 @@ static int tcp_xfer_deliver ( struct tcp_connection *tcp,
 		return 0;
 	}
 
+	DBGC2 ( tcp, "TCP %p queueing %p (#%zd)\n", tcp, iobuf,
+		iob_len ( iobuf ) );
+
 	/* Enqueue buffer */
-	list_add_tail ( &iobuf->list, &tcp->tx_queue );
+	list_add_tail ( &iobuf->list, &tcp->tx_data_queue );
 
 	/* When the tx buffer is empty, it has no edge. Initialize
 	   it when it occurs */
-	if ( tcp->tx_edge.iobuf == NULL ) {
-		tcp->tx_edge.iobuf = iobuf;
-		tcp->tx_edge.offset = 0;
+	if ( tcp->tx_unsegmented.iobuf == NULL ) {
+		tcp->tx_unsegmented.iobuf = iobuf;
+		tcp->tx_unsegmented.offset = 0;
 	}
 
-	/* Each enqueued packet is a pending operation */
+	/* Update the count of unsegmented bytes */
+	tcp->tx_unsegmented_len += iob_len ( iobuf );
+
+	/* Each enqueued buffer is a pending operation */
 	pending_get ( &tcp->pending_data );
 
 	/* Transmit data, if possible */

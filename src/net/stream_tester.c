@@ -50,6 +50,8 @@ struct stream_tester {
 	unsigned char tx_cycle;
 	struct interface xfer;
 	struct interface remote;
+
+	size_t tx_remaining;
 };
 
 static void stream_tester_close ( struct stream_tester *stream_tester, int rc ) {
@@ -91,18 +93,21 @@ static void stream_tester_tx ( struct stream_tester * tester ) {
 
 	size_t window_size = xfer_window ( &tester->remote );
 
-	/* DBG ( "STREAM_TESTER %p window changed: %zd\n", tester, window_size ); */
+	DBG ( "STREAM_TESTER %p window changed: %zd\n", tester, window_size );
 
 	if ( ! window_size )
 		return;
 
-	const size_t max_size = window_size;
+	const size_t max_size = tester->tx_remaining;
 	size_t alloc_size = window_size;
 	if ( alloc_size > max_size )
 		alloc_size = max_size;
 
 	struct io_buffer * io_buf = alloc_iob ( alloc_size );
 	if ( !io_buf ) {
+		DBGC ( tester, "STREAM_TESTER %p couldn't allocate %zd bytes"
+		       " buffer\n", tester, alloc_size );
+
 		rc = -ENOBUFS;
 		goto err_alloc;
 	}
@@ -116,6 +121,14 @@ static void stream_tester_tx ( struct stream_tester * tester ) {
 	if ( ( rc = xfer_deliver_iob ( &tester->remote,
 				       iob_disown ( io_buf ) ) ) != 0 )
 		goto err_deliver;
+
+	tester->tx_remaining -= alloc_size;
+
+	if ( tester->tx_remaining == 0 ) {
+		DBGC ( tester, "STREAM_TESTER %p done transmitting, closing\n",
+		       tester );
+		stream_tester_close ( tester, 0 );
+	}
 
 	return;
 
@@ -159,6 +172,8 @@ static int stream_tester_open ( struct interface *xfer, struct uri *uri ) {
 	}
 
 	ref_init ( &tester->refcnt, NULL );
+
+	tester->tx_remaining = 3000000;
 
 	intf_init ( &tester->xfer, &tester_xfer_desc, &tester->refcnt );
 	intf_init ( &tester->remote, &tester_desc, &tester->refcnt );

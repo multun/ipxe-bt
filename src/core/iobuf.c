@@ -35,6 +35,21 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
  *
  */
 
+static int metadata_printed;
+
+static void print_metadata() {
+    metadata_printed++;
+}
+
+#define print_metadata_done( Addr, Size )                                      \
+	do {                                                                   \
+		if ( ( Addr ) && --metadata_printed == 0 ) {                   \
+			DBG ( "IOBAlloc %p %p %zd\n",                          \
+			      __builtin_return_address ( 0 ), ( Addr ),        \
+			      ( Size ) );                                      \
+		}                                                              \
+	} while ( 0 )
+
 /**
  * Allocate I/O buffer with specified alignment and offset
  *
@@ -52,6 +67,8 @@ struct io_buffer * alloc_iob_raw ( size_t len, size_t align, size_t offset ) {
 	unsigned int align_log2;
 	void *data;
 
+	print_metadata ();
+
 	/* Calculate padding required below alignment boundary to
 	 * ensure that a correctly aligned inline struct io_buffer
 	 * could fit (regardless of the requested offset).
@@ -68,8 +85,10 @@ struct io_buffer * alloc_iob_raw ( size_t len, size_t align, size_t offset ) {
 	 * a potentially undefined shift operation.
 	 */
 	align_log2 = fls ( align - 1 );
-	if ( align_log2 >= ( 8 * sizeof ( align ) ) )
+	if ( align_log2 >= ( 8 * sizeof ( align ) ) ) {
+		print_metadata_done ( NULL, len );
 		return NULL;
+	}
 	align = ( 1UL << align_log2 );
 
 	/* Calculate length threshold */
@@ -90,21 +109,26 @@ struct io_buffer * alloc_iob_raw ( size_t len, size_t align, size_t offset ) {
 		/* Allocate memory for buffer plus descriptor */
 		data = malloc_dma_offset ( len + sizeof ( *iobuf ), align,
 					   offset );
-		if ( ! data )
+		if ( ! data ) {
+			print_metadata_done ( NULL, len );
 			return NULL;
+		}
 		iobuf = ( data + len );
 
 	} else {
 
 		/* Allocate memory for buffer */
 		data = malloc_dma_offset ( len, align, offset );
-		if ( ! data )
+		if ( !data ) {
+			print_metadata_done ( NULL, len );
 			return NULL;
+		}
 
 		/* Allocate memory for descriptor */
 		iobuf = malloc ( sizeof ( *iobuf ) );
 		if ( ! iobuf ) {
 			free_dma ( data, len );
+			print_metadata_done ( NULL, len );
 			return NULL;
 		}
 	}
@@ -113,6 +137,7 @@ struct io_buffer * alloc_iob_raw ( size_t len, size_t align, size_t offset ) {
 	iobuf->head = iobuf->data = iobuf->tail = data;
 	iobuf->end = ( data + len );
 
+	print_metadata_done ( iobuf, len );
 	return iobuf;
 }
 
@@ -131,10 +156,14 @@ struct io_buffer * alloc_iob ( size_t len ) {
 	if ( len < IOB_ZLEN )
 		len = IOB_ZLEN;
 
+	print_metadata ();
+
 	/* Align buffer on its own size to avoid potential problems
 	 * with boundary-crossing DMA.
 	 */
-	return alloc_iob_raw ( len, len, 0 );
+	struct io_buffer *res = alloc_iob_raw ( len, len, 0 );
+	print_metadata_done ( res, len );
+	return res;
 }
 
 /**
@@ -148,6 +177,8 @@ void free_iob ( struct io_buffer *iobuf ) {
 	/* Allow free_iob(NULL) to be valid */
 	if ( ! iobuf )
 		return;
+
+	DBG ( "IOBFree %p %p\n", __builtin_return_address ( 0 ), iobuf );
 
 	/* Sanity checks */
 	assert ( iobuf->head <= iobuf->data );
