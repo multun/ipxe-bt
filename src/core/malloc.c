@@ -33,6 +33,8 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
 #include <ipxe/refcnt.h>
 #include <ipxe/malloc.h>
 #include <valgrind/memcheck.h>
+#include <ipxe/malloc_checker.h>
+
 
 /** @file
  *
@@ -276,7 +278,14 @@ static void discard_all_cache ( void ) {
  *
  * @c align must be a power of two.  @c size may not be zero.
  */
+
+void * _alloc_memblock ( size_t size, size_t align, size_t offset );
 void * alloc_memblock ( size_t size, size_t align, size_t offset ) {
+    void *res = _alloc_memblock(size, align, offset);
+    /* register_alloc(res); */
+    return res;
+}
+void * _alloc_memblock ( size_t size, size_t align, size_t offset ) {
 	struct memory_block *block;
 	size_t align_mask;
 	size_t actual_size;
@@ -310,7 +319,7 @@ void * alloc_memblock ( size_t size, size_t align, size_t offset ) {
 	assert ( actual_size >= size );
 	align_mask = ( ( align - 1 ) | ( MIN_MEMBLOCK_SIZE - 1 ) );
 
-	DBGC2 ( &heap, "Allocating %#zx (aligned %#zx+%zx)\n",
+	DBGC2 ( &heap, "\nAllocating %#zx (aligned %#zx+%zx)\n",
 		size, align, offset );
 	while ( 1 ) {
 		/* Search through blocks for the first one with enough space */
@@ -401,7 +410,12 @@ void * alloc_memblock ( size_t size, size_t align, size_t offset ) {
  *
  * If @c ptr is NULL, no action is taken.
  */
+void _free_memblock ( void *ptr, size_t size );
 void free_memblock ( void *ptr, size_t size ) {
+    /* unregister_alloc(ptr); */
+    _free_memblock(ptr, size);
+}
+void _free_memblock ( void *ptr, size_t size ) {
 	struct memory_block *freeing;
 	struct memory_block *block;
 	struct memory_block *tmp;
@@ -426,7 +440,7 @@ void free_memblock ( void *ptr, size_t size ) {
 			~( MIN_MEMBLOCK_SIZE - 1 ) );
 	freeing = ptr;
 	VALGRIND_MAKE_MEM_UNDEFINED ( freeing, sizeof ( *freeing ) );
-	DBGC2 ( &heap, "Freeing [%p,%p)\n",
+	DBGC2 ( &heap, "\nFreeing [%p,%p)\n",
 		freeing, ( ( ( void * ) freeing ) + size ) );
 
 	/* Check that this block does not overlap the free list */
@@ -602,7 +616,6 @@ void * malloc ( size_t size ) {
  * If @c ptr is NULL, no action is taken.
  */
 void free ( void *ptr ) {
-
 	realloc ( ptr, 0 );
 	if ( ASSERTED ) {
 		DBGC ( &heap, "Possible memory corruption detected from %p\n",

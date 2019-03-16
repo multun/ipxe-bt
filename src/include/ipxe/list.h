@@ -125,6 +125,7 @@ static inline void inline_list_del ( struct list_head *list ) {
 	struct list_head *prev = (list)->prev;
 	next->prev = prev;
 	prev->next = next;
+        list->next = list->prev = NULL;
 }
 extern void extern_list_del ( struct list_head *list );
 

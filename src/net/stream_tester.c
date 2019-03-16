@@ -63,8 +63,8 @@ static void stream_tester_close ( struct stream_tester *stream_tester, int rc ) 
 }
 
 static int stream_tester_deliver ( struct stream_tester *stream_tester,
-                                struct io_buffer *iobuf,
-                                struct xfer_metadata *meta __unused ) {
+                                   struct io_buffer *iobuf,
+                                   struct xfer_metadata *meta __unused ) {
 	int rc;
 
 	unsigned char *buf_beg = iobuf->data;
@@ -173,7 +173,7 @@ static int stream_tester_open ( struct interface *xfer, struct uri *uri ) {
 
 	ref_init ( &tester->refcnt, NULL );
 
-	tester->tx_remaining = 3000000;
+	tester->tx_remaining = 1000000;
 
 	intf_init ( &tester->xfer, &tester_xfer_desc, &tester->refcnt );
 	intf_init ( &tester->remote, &tester_desc, &tester->refcnt );
@@ -184,10 +184,15 @@ static int stream_tester_open ( struct interface *xfer, struct uri *uri ) {
 
 	struct uri * new_uri = uri_dup ( &tmp_uri );
 
-	if ( ( rc = xfer_open_uri ( &tester->remote, new_uri ) ) < 0 )
-		goto err_open;
+	rc = xfer_open_uri ( &tester->remote, new_uri );
+
+        uri_put ( new_uri );
+
+        if ( rc < 0 )
+            goto err_open;
 
 	intf_plug_plug ( xfer, &tester->xfer );
+        intf_put ( &tester->xfer );
 	return 0;
 
 err_open:

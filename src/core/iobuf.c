@@ -43,8 +43,9 @@ static void print_metadata() {
 
 #define print_metadata_done( Addr, Size )                                      \
 	do {                                                                   \
-		if ( ( Addr ) && --metadata_printed == 0 ) {                   \
-			DBG ( "IOBAlloc %p %p %zd\n",                          \
+		metadata_printed--;                                            \
+		if ( ( Addr ) && metadata_printed == 0 ) {                     \
+			DBG ( "\nIOBAlloc %p %p %zd\n",                        \
 			      __builtin_return_address ( 0 ), ( Addr ),        \
 			      ( Size ) );                                      \
 		}                                                              \
@@ -178,7 +179,7 @@ void free_iob ( struct io_buffer *iobuf ) {
 	if ( ! iobuf )
 		return;
 
-	DBG ( "IOBFree %p %p\n", __builtin_return_address ( 0 ), iobuf );
+	DBG ( "\nIOBFree %p %p\n", __builtin_return_address ( 0 ), iobuf );
 
 	/* Sanity checks */
 	assert ( iobuf->head <= iobuf->data );

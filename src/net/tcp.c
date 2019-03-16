@@ -228,7 +228,7 @@ struct tcp_connection {
 };
 
 static size_t tcp_inflight ( struct tcp_connection * conn ) {
-	return conn->snd_una - conn->snd_nxt;
+	return conn->snd_nxt - conn->snd_una;
 }
 
 /** A TCP connection */
@@ -710,13 +710,22 @@ static size_t tcp_xmit_win ( struct tcp_connection *tcp ) {
 	if ( ! TCP_CAN_SEND_DATA ( tcp->tcp_state ) )
 		return 0;
 
+	size_t max_win = tcp->snd_win;
+	if ( max_win > 32000 )
+		max_win = 32000;
+
 	/* Compute the sequence number of the right edge of the window */
-	win_seq_limit = tcp->snd_una + tcp->snd_win;
+	win_seq_limit = tcp->snd_una + max_win;
 
 	/* TODO: The window _shouldn't_ shrink. Either RST or implement proper trimming */
 	assert ( tcp_cmp ( tcp->snd_nxt, win_seq_limit ) <= 0 );
 
-	return win_seq_limit - tcp->snd_nxt;
+	size_t res = win_seq_limit - tcp->snd_nxt;
+        size_t inflight = tcp_inflight ( tcp );
+
+        DBGC2(tcp, "TCP %p window announced %zd inflight %zd\n", tcp, res, inflight);
+        return res;
+
 }
 
 /**
@@ -926,6 +935,7 @@ static int tcp_prepare_tx_segment ( struct tcp_connection *tcp,
 	if ( seq_len == 0 )
 		return 0;
 
+        DBGC ( tcp, "TCP %p allocated segment\n", tcp );
 	segment = zalloc ( sizeof ( *segment ) );
 	if ( segment == NULL ) {
 		rc = -ENOMEM;
@@ -990,6 +1000,39 @@ static void tcp_register_ack ( struct tcp_connection * tcp, uint32_t ack,
 	}
 }
 
+/* TODO: remove this, for debug only */
+static inline size_t list_len ( struct list_head *head ) {
+	struct list_head *tmp;
+	size_t size = 0;
+
+	list_for_each ( tmp, head ) {
+		size++;
+	}
+	return size;
+}
+
+
+static void print_queue_size(struct tcp_connection  * tcp ) {
+	struct tcp_tx_queued_segment *seg;
+
+	size_t segment_count = list_len ( &tcp->tx_segments );
+	DBGC ( tcp, "TCP %p tx_segments_count %zd\n", tcp, segment_count );
+	DBGC ( tcp, "TCP %p tx_data_queue %zd\n", tcp,
+	       list_len ( &tcp->tx_data_queue ) );
+
+	size_t queued_size = 0;
+	size_t queue_seq_len = 0;
+	list_for_each_entry ( seg, &tcp->tx_segments, list ) {
+		queued_size += seg->len;
+		queue_seq_len += tcp_segment_seq_len ( seg->len, seg->flags );
+	}
+
+	DBGC2 ( tcp, "TCP %p queue_size len %zd seq_len %zd expected %zd\n", tcp,
+		queued_size, queue_seq_len, tcp_inflight ( tcp ) );
+}
+
+
+
 /* Free any acknowledged segment and associated buffers */
 static void tcp_trim_tx_queue ( struct tcp_connection *tcp ) {
 	struct tcp_tx_queued_segment *seg;
@@ -999,6 +1042,7 @@ static void tcp_trim_tx_queue ( struct tcp_connection *tcp ) {
 	struct io_buffer *next_bound_buf;
 	struct io_buffer *tmp;
 
+        //print_queue_size(tcp);
 	list_for_each_entry_safe ( seg, next_seg, &tcp->tx_segments, list ) {
 		if ( ! tcp_segment_is_acknowledged ( seg ) )
 			break;
@@ -1040,6 +1084,8 @@ static void tcp_trim_tx_queue ( struct tcp_connection *tcp ) {
 		/* Free the segment */
 		free ( seg );
 	}
+
+	print_queue_size ( tcp );
 }
 
 static int tcp_xmit_segment ( struct tcp_connection *tcp, uint32_t sack_seq,
@@ -1195,7 +1241,7 @@ static int tcp_xmit_segment ( struct tcp_connection *tcp, uint32_t sack_seq,
 
 /* sort of duplicate of the retry timer logic, but enables having a single
  * timeout for all segments */
-static void tcp_schedule_retransmissions ( struct tcp_connection * tcp ) {
+static void __attribute__((unused)) tcp_schedule_retransmissions ( struct tcp_connection * tcp ) {
 	struct tcp_tx_queued_segment *segment;
 	uint32_t now = currticks ();
 	uint32_t runtime;
@@ -1230,9 +1276,12 @@ static void tcp_schedule_retransmissions ( struct tcp_connection * tcp ) {
 		       tcp_segment_seq_len ( segment->seq, segment->flags ),
 		       tcp->rcv_ack );
 
+		DBGC ( tcp, "TCP %p former queue size\n", tcp );
+
 		/* Move the segment to the tx queue */
 		list_del ( &segment->queue_list );
 		list_add ( &segment->queue_list, &tcp->tx_queue );
+		DBGC ( tcp, "TCP %p new queue size\n", tcp );
 	}
 }
 
@@ -1254,6 +1303,9 @@ static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
 	size_t win;
 	int rc;
 
+	if ( !( tcp->tcp_state & TCP_STATE_RCVD ( TCP_SYN ) ) )
+		tcp_schedule_retransmissions ( tcp );
+
 	while ( true ) {
 		win = tcp_xmit_win ( tcp );
 
@@ -1262,6 +1314,7 @@ static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
 
 		/* Look for candidate retransmissions in the ack_pending queue
 		 */
+                // TODO: reenable this
 		tcp_schedule_retransmissions ( tcp );
 
 		/* If there's no segment ready to be transmitted, try to make
@@ -1271,7 +1324,7 @@ static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
 			/* Return if something went wrong */
 			return;
 		}
-
+        
 		/* Get the first segment of the tx queue */
 		segment = list_first_entry (
 		    &tcp->tx_queue, struct tcp_tx_queued_segment, queue_list );
@@ -1313,7 +1366,7 @@ static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
  * @v tcp		TCP connection
  */
 static void tcp_xmit ( struct tcp_connection *tcp ) {
-
+    DBGC ( tcp, "TCP %p window_size %zd\n", tcp, tcp_xmit_win ( tcp ) );
 	/* Transmit without an explicit first SACK */
 	tcp_xmit_sack ( tcp, tcp->rcv_ack );
 }
