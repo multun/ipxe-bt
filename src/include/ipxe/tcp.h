@@ -401,7 +401,7 @@ struct tcp_options {
  * greater than zero if @c seq1 is found, respectively, to be before,
  * equal to, or after @c seq2.
  */
-static inline __attribute__ (( always_inline )) int32_t
+static inline __always_inline int32_t
 tcp_cmp ( uint32_t seq1, uint32_t seq2 ) {
 	return ( ( int32_t ) ( seq1 - seq2 ) );
 }
@@ -417,6 +417,26 @@ tcp_cmp ( uint32_t seq1, uint32_t seq2 ) {
 static inline int tcp_in_window ( uint32_t seq, uint32_t start,
 				  uint32_t len ) {
 	return ( ( seq - start ) < len );
+}
+
+static inline __always_inline __pure int
+tcp_range_in_window ( uint32_t win_begin, uint32_t win_end,
+		      uint32_t range_begin, uint32_t range_end ) {
+	uint32_t win_len = win_end - win_begin;
+	uint32_t range_len = range_end - range_begin;
+
+	if ( ! tcp_in_window ( range_begin, win_begin, win_len ) )
+		return 0;
+
+        /* comparing the bounds this way is critical: it
+           ensure both bounds of the window get wrapped around
+           relative to the same reference point.
+
+	   win_right >= range_end
+	   win_left + win_len >= range_begin + range_len
+	   win_left - range_begin >= range_len - win_len */
+	return ( tcp_cmp ( win_begin, range_begin ) >=
+		 tcp_cmp ( range_len, win_len ) );
 }
 
 /** TCP finish wait time

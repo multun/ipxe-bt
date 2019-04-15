@@ -19,6 +19,7 @@
 #include <ipxe/process.h>
 #include <ipxe/tcpip.h>
 #include <ipxe/tcp.h>
+#include <ipxe/fault.h>
 
 /** @file
  *
@@ -53,6 +54,9 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
  * @endcode
  *
  */
+
+#define TCP_TX_FAULT 2
+#define TCP_RX_FAULT 0
 
 /** A pointer to some byte of an io_buffer */
 struct iobuf_cursor {
@@ -426,7 +430,7 @@ static int tcp_finalize_open ( struct tcp_connection *tcp,
 	INIT_LIST_HEAD ( &tcp->tx_ack_pending );
 	INIT_LIST_HEAD ( &tcp->rx_queue );
 	memcpy ( &tcp->peer, st_peer, sizeof ( tcp->peer ) );
-	tcp->tx_timeout = TCP_MSL; // TODO: RTFM
+	tcp->tx_timeout = 4 * TICKS_PER_SEC; // TODO: RTFM
 
 	/* Calculate MSS */
 	mtu = tcpip_mtu ( &tcp->peer );
@@ -610,6 +614,7 @@ int tcp_listen ( struct interface * xfer, struct sockaddr * local ) {
  */
 static void tcp_close ( struct tcp_connection *tcp, int rc ) {
 	struct io_buffer *iobuf;
+
 	struct io_buffer *tmp_buf;
 
 	struct tcp_tx_queued_segment *seg;
@@ -711,7 +716,7 @@ static size_t tcp_xmit_win ( struct tcp_connection *tcp ) {
 		return 0;
 
 	size_t max_win = tcp->snd_win;
-	if ( max_win > 32000 )
+	if ( max_win > 32000 ) /* TODO: stop hardcoding this */
 		max_win = 32000;
 
 	/* Compute the sequence number of the right edge of the window */
@@ -721,11 +726,10 @@ static size_t tcp_xmit_win ( struct tcp_connection *tcp ) {
 	assert ( tcp_cmp ( tcp->snd_nxt, win_seq_limit ) <= 0 );
 
 	size_t res = win_seq_limit - tcp->snd_nxt;
-        size_t inflight = tcp_inflight ( tcp );
+        /* size_t inflight = tcp_inflight ( tcp ); */
 
-        DBGC2(tcp, "TCP %p window announced %zd inflight %zd\n", tcp, res, inflight);
+        /* DBGC2(tcp, "TCP %p window announced %zd inflight %zd\n", tcp, res, inflight); */
         return res;
-
 }
 
 /**
@@ -986,9 +990,8 @@ static void tcp_register_ack ( struct tcp_connection * tcp, uint32_t ack,
 			continue;
 
 		if ( tcp_cmp ( ack, seq_end ) >= 0 ||
-		     /* TODO: ensure this is ok */
-		     ( tcp_cmp ( sack_left, seq ) <= 0 &&
-		       tcp_cmp ( sack_right, seq_end ) >= 0 ) ) {
+		     tcp_range_in_window ( sack_left, sack_right, seq,
+					   seq_end ) ) {
 			DBGC2 ( segment, "TCP_SEGMENT %p marked as "
 				"acknowledged\n", segment );
 			/* Remove the segment from the retransmission queue */
@@ -1020,7 +1023,7 @@ static void print_queue_size(struct tcp_connection  * tcp ) {
 	DBGC ( tcp, "TCP %p tx_data_queue %zd\n", tcp,
 	       list_len ( &tcp->tx_data_queue ) );
 
-	size_t queued_size = 0;
+	size_t queued_size = 0; 
 	size_t queue_seq_len = 0;
 	list_for_each_entry ( seg, &tcp->tx_segments, list ) {
 		queued_size += seg->len;
@@ -1220,6 +1223,12 @@ static int tcp_xmit_segment ( struct tcp_connection *tcp, uint32_t sack_seq,
 	tcp_dump_flags ( tcp, tcphdr->flags );
 	DBGC2 ( tcp, "\n" );
 
+	if ( inject_fault ( TCP_TX_FAULT ) ) {
+		DBGC ( tcp, "TCP %p >>> Injected transmission fault <<<\n", tcp );
+	        free_iob ( iobuf );
+		goto segment_transmitted;
+	}
+
 	/* Transmit packet */
 	if ( ( rc = tcpip_tx ( iobuf, &tcp_protocol, NULL, &tcp->peer, NULL,
 			       &tcphdr->csum ) ) != 0 ) {
@@ -1229,6 +1238,7 @@ static int tcp_xmit_segment ( struct tcp_connection *tcp, uint32_t sack_seq,
 		return rc;
 	}
 
+segment_transmitted:
 	DBGC2 ( segment, "TCP_SEGMENT %p transmitted\n", segment );
 
 	/* Update segment metadata */
@@ -1276,12 +1286,12 @@ static void __attribute__((unused)) tcp_schedule_retransmissions ( struct tcp_co
 		       tcp_segment_seq_len ( segment->seq, segment->flags ),
 		       tcp->rcv_ack );
 
-		DBGC ( tcp, "TCP %p former queue size\n", tcp );
 
 		/* Move the segment to the tx queue */
 		list_del ( &segment->queue_list );
 		list_add ( &segment->queue_list, &tcp->tx_queue );
-		DBGC ( tcp, "TCP %p new queue size\n", tcp );
+		DBGC ( tcp, "TCP %p new tx queue size %zu\n", tcp,
+		       list_len ( &tcp->tx_queue ) );
 	}
 }
 
@@ -1303,8 +1313,10 @@ static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
 	size_t win;
 	int rc;
 
-	if ( !( tcp->tcp_state & TCP_STATE_RCVD ( TCP_SYN ) ) )
+
+	/* if ( !( tcp->tcp_state & TCP_STATE_RCVD ( TCP_SYN ) ) ) { */
 		tcp_schedule_retransmissions ( tcp );
+        /* } */
 
 	while ( true ) {
 		win = tcp_xmit_win ( tcp );
@@ -1312,10 +1324,10 @@ static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
 		if ( win > TCP_PATH_MTU )
 			win = TCP_PATH_MTU;
 
-		/* Look for candidate retransmissions in the ack_pending queue
-		 */
-                // TODO: reenable this
-		tcp_schedule_retransmissions ( tcp );
+		/* /\* Look for candidate retransmissions in the ack_pending queue */
+		/*  *\/ */
+                /* // TODO: reenable this */
+		/* tcp_schedule_retransmissions ( tcp ); */
 
 		/* If there's no segment ready to be transmitted, try to make
 		 * one */
@@ -1366,9 +1378,9 @@ static void tcp_xmit_sack ( struct tcp_connection *tcp, uint32_t sack_seq ) {
  * @v tcp		TCP connection
  */
 static void tcp_xmit ( struct tcp_connection *tcp ) {
-    DBGC ( tcp, "TCP %p window_size %zd\n", tcp, tcp_xmit_win ( tcp ) );
 	/* Transmit without an explicit first SACK */
 	tcp_xmit_sack ( tcp, tcp->rcv_ack );
+	process_add ( &tcp->process );
 }
 
 /** TCP process descriptor */
@@ -2004,6 +2016,12 @@ static int tcp_rx ( struct io_buffer *iobuf,
 	uint32_t seq_len;
 	size_t old_xfer_window;
 	int rc;
+
+	if ( inject_fault ( TCP_RX_FAULT ) ) {
+		DBG ( "TCP >>> Injected RX fault <<<.\n" );
+		rc = 0;
+		goto discard;
+	}
 
 	/* Start profiling */
 	profile_start ( &tcp_rx_profiler );
